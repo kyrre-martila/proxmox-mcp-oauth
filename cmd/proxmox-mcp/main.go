@@ -132,13 +132,18 @@ func serve() error {
 		IdleTimeout:       120 * time.Second,
 		// No WriteTimeout: a tool call waiting for a Proxmox task can take minutes.
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
 	}()
-	return httpserver.Serve(srv, ln, cfg.HTTP)
+	err = httpserver.Serve(srv, ln, cfg.HTTP)
+	stop()
+	<-shutdownDone // Finish in-flight OAuth snapshots before releasing the store lock.
+	return err
 }
 
 // healthcheckAddr is where the server listening on MCP_HTTP_HOST can be reached locally: that

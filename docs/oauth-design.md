@@ -15,7 +15,9 @@ protocol boundaries, not PHP code.
   is the sole resource. Never infer either from forwarded headers.
 * Public clients use dynamic registration (`none` authentication), exact HTTPS
   redirect allowlisting, authorization code and mandatory S256 PKCE. No implicit,
-  password or client credentials grants, URL metadata fetching or wildcard redirects.
+  password or client credentials grants or wildcard redirects. Review adds restricted
+  ChatGPT CIMD discovery with bounded HTTPS fetching; arbitrary metadata hosts
+  remain unsupported.
 * One operator configured bcrypt credential authenticates every consent. No signup
   or ambient login session. Consent is an explicit POST bound to a random,
   short-lived HttpOnly Secure SameSite cookie and server-side request.
@@ -33,3 +35,13 @@ protocol boundaries, not PHP code.
 Implementation stays in internal/oauth plus narrow config/transport wiring to ease
 upstream merges. Automated tests cover protocol and authentication boundaries.
 Real ChatGPT validation requires a separately approved HTTPS test deployment.
+
+
+## Pre-merge hardening
+
+CIMD, issuer-bearing error redirects, strict registration parsing, independent
+registration/password limits and code replay revocation were added after review.
+Snapshots now have a durable interrupted-write marker and are bound to the issuer,
+administrator hash and redirect policy. Changed policy revokes codes/grants.
+Blocking bodies, metadata requests and bcrypt run outside the state mutex.
+See oauth.md for recovery and the remaining single-operator limitations.

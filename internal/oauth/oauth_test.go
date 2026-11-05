@@ -19,15 +19,17 @@ import (
 
 func setup(t *testing.T) *Server {
 	t.Helper()
-	hash, _ := bcrypt.GenerateFromPassword([]byte("test-password"), bcrypt.MinCost)
+	hash, _ := bcrypt.GenerateFromPassword([]byte("test-password"), 10)
 	dir := t.TempDir()
 	_ = os.Chmod(dir, 0700)
-	s, e := New(Config{"https://mcp.example", string(hash), dir, []string{"https://chatgpt.com/connector_platform/oauth_redirect"}})
+	s, e := New(Config{"https://mcp.example", string(hash), dir, []string{"https://chatgpt.com/connector_platform_oauth_redirect"}})
 	if e != nil {
 		t.Fatal(e)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	s.limit = rate.NewLimiter(rate.Inf, 1)
+	s.registrationLimit = rate.NewLimiter(rate.Inf, 1)
+	s.passwordLimit = rate.NewLimiter(rate.Inf, 1)
 	return s
 }
 func request(s *Server, method, path string, v url.Values, cookie *http.Cookie) *httptest.ResponseRecorder {
@@ -57,8 +59,9 @@ func decode(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 }
 func register(t *testing.T, s *Server) string {
 	t.Helper()
-	r := httptest.NewRequest("POST", "https://mcp.example/oauth/register", strings.NewReader(`{"redirect_uris":["https://chatgpt.com/connector_platform/oauth_redirect"],"token_endpoint_auth_method":"none"}`))
+	r := httptest.NewRequest("POST", "https://mcp.example/oauth/register", strings.NewReader(`{"redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"],"token_endpoint_auth_method":"none"}`))
 	w := httptest.NewRecorder()
+	r.Header.Set("Content-Type", "application/json")
 	s.ServeHTTP(w, r)
 	if w.Code != 201 {
 		t.Fatal(w.Code, w.Body.String())
@@ -104,9 +107,7 @@ func TestFlowRotationReplayExpiryAndPersistence(t *testing.T) {
 	if !s.Valid(tokens["access_token"].(string)) {
 		t.Fatal("access rejected")
 	}
-	if w = exchange(s, id, c, v); w.Code != 400 {
-		t.Fatal("code replay")
-	}
+
 	raw, e := os.ReadFile(s.cfg.Directory + "/state.json")
 	if e != nil || strings.Contains(string(raw), tokens["access_token"].(string)) || strings.Contains(string(raw), tokens["refresh_token"].(string)) {
 		t.Fatal("plaintext secret persisted")
@@ -154,8 +155,16 @@ func TestAuthorizationBoundaries(t *testing.T) {
 	for _, field := range []string{"redirect_uri", "resource", "code_challenge_method", "response_type", "scope"} {
 		q := authQuery(s, id, v)
 		q.Set(field, "invalid")
-		if w := request(s, "GET", "/oauth/authorize", q, nil); w.Code != 400 || w.Header().Get("Location") != "" {
-			t.Fatal(field, w.Code)
+		w := request(s, "GET", "/oauth/authorize", q, nil)
+		if field == "redirect_uri" {
+			if w.Code != 400 || w.Header().Get("Location") != "" {
+				t.Fatal(field, w.Code)
+			}
+		} else {
+			u, _ := url.Parse(w.Header().Get("Location"))
+			if w.Code != 303 || u.Query().Get("iss") != s.cfg.Issuer || u.Query().Get("error") == "" {
+				t.Fatal(field, w.Code)
+			}
 		}
 	}
 	for _, mode := range []string{"cookie", "password", "origin", "deny"} {

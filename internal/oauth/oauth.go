@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,18 +42,18 @@ func (c Config) Validate() error {
 		return nil
 	}
 	u, e := url.Parse(c.Issuer)
-	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || c.Issuer != "https://"+u.Host {
 		return errors.New("MCP_OAUTH_ISSUER must be an HTTPS origin without a trailing slash")
 	}
-	if _, e = bcrypt.Cost([]byte(c.AdminHash)); e != nil {
-		return errors.New("MCP_OAUTH_ADMIN_HASH must be a bcrypt password hash")
+	if cost, err := bcrypt.Cost([]byte(c.AdminHash)); err != nil || cost < 10 || cost > 14 {
+		return errors.New("MCP_OAUTH_ADMIN_HASH must be a bcrypt hash with cost 10 through 14")
 	}
 	if !filepath.IsAbs(c.Directory) || len(c.Redirects) == 0 {
 		return errors.New("OAuth requires an absolute state directory and exact redirect allowlist")
 	}
 	for _, s := range c.Redirects {
 		u, e := url.Parse(s)
-		if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
+		if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || strings.Contains(s, "#") {
 			return errors.New("OAuth redirect allowlist must contain exact HTTPS URLs")
 		}
 	}
@@ -63,15 +65,16 @@ type client struct {
 	Name      string   `json:"client_name"`
 }
 type grant struct {
-	Client, Resource, Access, Refresh string
-	Used                              []string
-	AccessUntil, Until                time.Time
+	Client, Resource, Access, Refresh, Code string
+	Used                                    []string
+	AccessUntil, Until                      time.Time
 }
 type code struct {
 	Client, Redirect, Challenge, Resource string
 	Until                                 time.Time
 }
 type state struct {
+	Binding string
 	Clients map[string]client
 	Codes   map[string]code
 	Grants  map[string]grant
@@ -82,14 +85,17 @@ type pending struct {
 	Until  time.Time
 }
 type Server struct {
-	cfg     Config
-	mu      sync.Mutex
-	state   state
-	pending map[string]pending
-	lock    *flock.Flock
-	limit   *rate.Limiter
-	now     func() time.Time
-	broken  bool
+	cfg               Config
+	mu                sync.Mutex
+	state             state
+	pending           map[string]pending
+	lock              *flock.Flock
+	limit             *rate.Limiter
+	registrationLimit *rate.Limiter
+	passwordLimit     *rate.Limiter
+	metadataHTTP      *http.Client
+	now               func() time.Time
+	broken            bool
 }
 
 func random() string { return base64.RawURLEncoding.EncodeToString(randBytes()) }
@@ -120,9 +126,13 @@ func New(c Config) (*Server, error) {
 	if e != nil || !locked {
 		return nil, errors.New("OAuth state already in use")
 	}
-	s := &Server{cfg: c, lock: f, pending: map[string]pending{}, limit: rate.NewLimiter(2, 10), now: time.Now}
-	s.state = state{map[string]client{}, map[string]code{}, map[string]grant{}}
-	b, e := os.ReadFile(filepath.Join(c.Directory, "state.json"))
+	s := &Server{cfg: c, lock: f, pending: map[string]pending{}, limit: rate.NewLimiter(10, 20), registrationLimit: rate.NewLimiter(rate.Every(10*time.Second), 5), passwordLimit: rate.NewLimiter(rate.Every(3*time.Second), 5), now: time.Now, metadataHTTP: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	s.state = state{Clients: map[string]client{}, Codes: map[string]code{}, Grants: map[string]grant{}}
+	if _, e := os.Lstat(filepath.Join(c.Directory, "pending-write")); e == nil || !os.IsNotExist(e) {
+		s.Close()
+		return nil, errors.New("OAuth interrupted write: reset state before recovery")
+	}
+	b, e := readState(c.Directory)
 	if e == nil {
 		e = json.Unmarshal(b, &s.state)
 	}
@@ -134,6 +144,16 @@ func New(c Config) (*Server, error) {
 		s.Close()
 		return nil, errors.New("invalid OAuth state")
 	}
+	binding := digest(c.Issuer + "\x00" + c.AdminHash + "\x00" + strings.Join(c.Redirects, "\x00"))
+	if s.state.Binding != binding {
+		s.state.Binding = binding
+		s.state.Codes = map[string]code{}
+		s.state.Grants = map[string]grant{}
+	}
+	if e = s.save(); e != nil {
+		s.Close()
+		return nil, errors.New("cannot persist OAuth state")
+	}
 	return s, nil
 }
 func (s *Server) Close() error { return s.lock.Close() }
@@ -143,11 +163,28 @@ func (s *Server) save() (err error) {
 			s.broken = true
 		}
 	}()
+	// A durable marker prevents restart from resurrecting an older snapshot.
+	marker := filepath.Join(s.cfg.Directory, "pending-write")
+	f, e := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if e != nil {
+		return e
+	}
+	e = f.Sync()
+	ce := f.Close()
+	if e == nil {
+		e = ce
+	}
+	if e != nil {
+		return e
+	}
+	if e = syncDirectory(s.cfg.Directory); e != nil {
+		return e
+	}
 	b, e := json.Marshal(s.state)
 	if e != nil {
 		return e
 	}
-	f, e := os.CreateTemp(s.cfg.Directory, ".state-")
+	f, e = os.CreateTemp(s.cfg.Directory, ".state-")
 	if e != nil {
 		return e
 	}
@@ -155,7 +192,7 @@ func (s *Server) save() (err error) {
 	if _, e = f.Write(b); e == nil {
 		e = f.Sync()
 	}
-	ce := f.Close()
+	ce = f.Close()
 	if e == nil {
 		e = ce
 	}
@@ -165,12 +202,13 @@ func (s *Server) save() (err error) {
 	if e = os.Rename(f.Name(), filepath.Join(s.cfg.Directory, "state.json")); e != nil {
 		return e
 	}
-	d, e := os.Open(s.cfg.Directory)
-	if e != nil {
+	if e = syncDirectory(s.cfg.Directory); e != nil {
 		return e
 	}
-	defer d.Close()
-	return d.Sync()
+	if e = os.Remove(marker); e != nil {
+		return e
+	}
+	return syncDirectory(s.cfg.Directory)
 }
 func jsonReply(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -182,7 +220,7 @@ func fail(w http.ResponseWriter, status int, code string) {
 }
 func (s *Server) resource() string { return s.cfg.Issuer + "/mcp" }
 func (s *Server) Challenge() string {
-	return fmt.Sprintf("Bearer resource_metadata=%q", s.cfg.Issuer+"/.well-known/oauth-protected-resource/mcp")
+	return fmt.Sprintf("Bearer scope=\"mcp\", resource_metadata=%q", s.cfg.Issuer+"/.well-known/oauth-protected-resource/mcp")
 }
 func (s *Server) Valid(token string) bool {
 	s.mu.Lock()
@@ -222,20 +260,67 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "oauth-protected-resource") {
 			jsonReply(w, 200, map[string]any{"resource": s.resource(), "authorization_servers": []string{s.cfg.Issuer}, "scopes_supported": []string{"mcp"}, "bearer_methods_supported": []string{"header"}})
 		} else {
-			jsonReply(w, 200, map[string]any{"issuer": s.cfg.Issuer, "authorization_endpoint": s.cfg.Issuer + "/oauth/authorize", "token_endpoint": s.cfg.Issuer + "/oauth/token", "registration_endpoint": s.cfg.Issuer + "/oauth/register", "revocation_endpoint": s.cfg.Issuer + "/oauth/revoke", "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "code_challenge_methods_supported": []string{"S256"}, "token_endpoint_auth_methods_supported": []string{"none"}, "scopes_supported": []string{"mcp"}, "authorization_response_iss_parameter_supported": true})
+			jsonReply(w, 200, map[string]any{"issuer": s.cfg.Issuer, "authorization_endpoint": s.cfg.Issuer + "/oauth/authorize", "token_endpoint": s.cfg.Issuer + "/oauth/token", "registration_endpoint": s.cfg.Issuer + "/oauth/register", "revocation_endpoint": s.cfg.Issuer + "/oauth/revoke", "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "code_challenge_methods_supported": []string{"S256"}, "token_endpoint_auth_methods_supported": []string{"none"}, "scopes_supported": []string{"mcp"}, "authorization_response_iss_parameter_supported": true, "client_id_metadata_document_supported": true, "revocation_endpoint_auth_methods_supported": []string{"none"}})
 		}
 		return
 	}
-	if !s.limit.Allow() {
+	limiter := s.limit
+	if r.URL.Path == "/oauth/register" {
+		limiter = s.registrationLimit
+	}
+	if !limiter.Allow() {
+		w.Header().Set("Retry-After", "10")
 		fail(w, 429, "temporarily_unavailable")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 16384)
+	// Never hold the state mutex while reading a client-controlled body.
+	if r.Method == "POST" {
+		b, e := io.ReadAll(r.Body)
+		if e != nil {
+			fail(w, 400, "invalid_request")
+			return
+		}
+		r.Body = io.NopCloser(strings.NewReader(string(b)))
+		want := "application/x-www-form-urlencoded"
+		if r.URL.Path == "/oauth/register" {
+			want = "application/json"
+		}
+		media, _, e := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if e != nil || media != want {
+			fail(w, 400, "invalid_request")
+			return
+		}
+		if want != "application/json" && (r.ParseForm() != nil || !single(r.PostForm)) {
+			fail(w, 400, "invalid_request")
+			return
+		}
+	}
+	var resolved *client
+	if r.URL.Path == "/oauth/authorize" && r.Method == "GET" {
+		cid := r.URL.Query().Get("client_id")
+		if strings.HasPrefix(cid, "https:") {
+			c, e := s.fetchMetadata(r.Context(), cid)
+			if e != nil {
+				fail(w, 400, "invalid_client")
+				return
+			}
+			resolved = &c
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.broken {
 		fail(w, 503, "temporarily_unavailable")
 		return
+	}
+	if resolved != nil {
+		cid := r.URL.Query().Get("client_id")
+		if _, ok := s.state.Clients[cid]; !ok && len(s.state.Clients) >= 100 {
+			fail(w, 503, "temporarily_unavailable")
+			return
+		}
+		s.state.Clients[cid] = *resolved
 	}
 	for k, v := range s.pending {
 		if !s.now().Before(v.Until) {
@@ -264,7 +349,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, "invalid_request")
 		return
 	}
-	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") || r.ParseForm() != nil || !single(r.PostForm) {
+	if r.ParseForm() != nil || !single(r.PostForm) {
 		fail(w, 400, "invalid_request")
 		return
 	}
@@ -291,33 +376,14 @@ func contains(a []string, b string) bool {
 	return false
 }
 func (s *Server) registration(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+	if r.Method != "POST" || r.URL.RawQuery != "" {
 		fail(w, 405, "invalid_request")
 		return
 	}
-	var v struct {
-		Redirects []string `json:"redirect_uris"`
-		Name      string   `json:"client_name"`
-		Auth      string   `json:"token_endpoint_auth_method"`
-		Grants    []string `json:"grant_types"`
-		Responses []string `json:"response_types"`
-		Scope     string   `json:"scope"`
-	}
-	if json.NewDecoder(r.Body).Decode(&v) != nil || len(v.Redirects) == 0 || len(v.Redirects) > 5 || len(v.Name) > 128 || (v.Auth != "" && v.Auth != "none") || (v.Scope != "" && v.Scope != "mcp") {
+	var v metadata
+	if decodeMetadata(r.Body, &v) != nil || v.Auth != "none" || v.Methods != nil || !v.validPublic() {
 		fail(w, 400, "invalid_client_metadata")
 		return
-	}
-	for _, g := range v.Grants {
-		if g != "authorization_code" && g != "refresh_token" {
-			fail(w, 400, "invalid_client_metadata")
-			return
-		}
-	}
-	for _, g := range v.Responses {
-		if g != "code" {
-			fail(w, 400, "invalid_client_metadata")
-			return
-		}
 	}
 	for _, u := range v.Redirects {
 		if !contains(s.cfg.Redirects, u) {
@@ -341,14 +407,29 @@ func (s *Server) registration(w http.ResponseWriter, r *http.Request) {
 
 var challengeRE = regexp.MustCompile("^[A-Za-z0-9_-]{43}$")
 var verifierRE = regexp.MustCompile("^[A-Za-z0-9._~-]{43,128}$")
-var consent = template.Must(template.New("consent").Parse(`<!doctype html><title>Authorize Proxmox MCP</title><h1>Authorize Proxmox MCP</h1><p>Client: {{.Name}}</p><p>Redirect: {{.Redirect}}</p><p>Allow access to all currently enabled Proxmox tools (scope mcp). Server permission controls still apply.</p><form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="{{.ID}}"><label>Administrator password <input type="password" name="password" required autocomplete="current-password"></label><button name="decision" value="allow">Authorize</button><button name="decision" value="deny" formnovalidate>Deny</button></form>`))
+var consent = template.Must(template.New("consent").Parse(`<!doctype html><title>Authorize Proxmox MCP</title><h1>Authorize Proxmox MCP</h1><p>Client (unverified display name): {{.Name}}</p><p>Client ID: {{.ClientID}}</p><p>Redirect: {{.Redirect}}</p><p>Allow access to all currently enabled Proxmox tools (scope mcp). Server permission controls still apply.</p><form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="{{.ID}}"><label>Administrator password <input type="password" name="password" required autocomplete="current-password"></label><button name="decision" value="allow">Authorize</button><button name="decision" value="deny" formnovalidate>Deny</button></form>`))
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		q, e := url.ParseQuery(r.URL.RawQuery)
 		c, ok := s.state.Clients[q.Get("client_id")]
-		if e != nil || len(r.URL.RawQuery) > 8192 || !single(q) || !ok || !contains(c.Redirects, q.Get("redirect_uri")) || q.Get("resource") != s.resource() || q.Get("response_type") != "code" || q.Get("code_challenge_method") != "S256" || !challengeRE.MatchString(q.Get("code_challenge")) || (q.Get("scope") != "" && q.Get("scope") != "mcp") || len(q.Get("state")) > 1024 {
+		if e != nil || len(r.URL.RawQuery) > 8192 || !single(q) || !ok || !contains(c.Redirects, q.Get("redirect_uri")) || !contains(s.cfg.Redirects, q.Get("redirect_uri")) || len(q.Get("state")) > 1024 {
 			fail(w, 400, "invalid_request")
+			return
+		}
+		errorCode := ""
+		switch {
+		case q.Get("response_type") != "code":
+			errorCode = "unsupported_response_type"
+		case q.Get("resource") != s.resource():
+			errorCode = "invalid_target"
+		case q.Get("scope") != "" && q.Get("scope") != "mcp":
+			errorCode = "invalid_scope"
+		case q.Get("code_challenge_method") != "S256" || !challengeRE.MatchString(q.Get("code_challenge")):
+			errorCode = "invalid_request"
+		}
+		if errorCode != "" {
+			s.authorizationError(w, r, q, errorCode)
 			return
 		}
 		if len(s.pending) >= 100 {
@@ -359,10 +440,10 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		s.pending[digest(id)] = pending{q, digest(cookie), s.now().Add(5 * time.Minute)}
 		http.SetCookie(w, &http.Cookie{Name: "__Host-mcp-consent", Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 300})
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = consent.Execute(w, struct{ Name, Redirect, ID string }{c.Name, q.Get("redirect_uri"), id})
+		_ = consent.Execute(w, struct{ Name, Redirect, ID, ClientID string }{c.Name, q.Get("redirect_uri"), id, q.Get("client_id")})
 		return
 	}
-	if r.Method != "POST" || r.URL.RawQuery != "" || r.Header.Get("Origin") != s.cfg.Issuer || r.ParseForm() != nil || !single(r.PostForm) {
+	if r.Method != "POST" || r.URL.RawQuery != "" || (len(r.Header.Values("Origin")) != 1 || r.Header.Get("Origin") != s.cfg.Issuer) || r.ParseForm() != nil || !single(r.PostForm) {
 		fail(w, 403, "access_denied")
 		return
 	}
@@ -377,12 +458,30 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	q := p.Query
 	dest, _ := url.Parse(q.Get("redirect_uri"))
 	values := dest.Query()
-	values.Set("state", q.Get("state"))
+	for _, k := range []string{"code", "error", "error_description", "state", "iss"} {
+		values.Del(k)
+	}
+	if q.Has("state") {
+		values.Set("state", q.Get("state"))
+	}
 	values.Set("iss", s.cfg.Issuer)
 	if r.PostForm.Get("decision") == "deny" {
 		values.Set("error", "access_denied")
 	} else {
-		if r.PostForm.Get("decision") != "allow" || bcrypt.CompareHashAndPassword([]byte(s.cfg.AdminHash), []byte(r.PostForm.Get("password"))) != nil {
+		if !s.passwordLimit.Allow() {
+			w.Header().Set("Retry-After", "3")
+			fail(w, 429, "temporarily_unavailable")
+			return
+		}
+		// The one-time request was consumed under lock; bcrypt must not block MCP.
+		s.mu.Unlock()
+		err := bcrypt.CompareHashAndPassword([]byte(s.cfg.AdminHash), []byte(r.PostForm.Get("password")))
+		s.mu.Lock()
+		if s.broken {
+			fail(w, 503, "temporarily_unavailable")
+			return
+		}
+		if r.PostForm.Get("decision") != "allow" || len(r.PostForm.Get("password")) > 72 || err != nil {
 			fail(w, 403, "access_denied")
 			return
 		}
@@ -406,11 +505,15 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	q := r.PostForm
 	cid := q.Get("client_id")
-	if _, ok := s.state.Clients[cid]; !ok || r.Header.Get("Authorization") != "" || q.Get("client_secret") != "" {
+	if _, ok := s.state.Clients[cid]; !ok || r.Header.Get("Authorization") != "" || q.Get("client_secret") != "" || q.Get("client_assertion") != "" || q.Get("client_assertion_type") != "" {
 		fail(w, 401, "invalid_client")
 		return
 	}
-	if q.Get("resource") != s.resource() || (q.Get("scope") != "" && q.Get("scope") != "mcp") {
+	if q.Get("scope") != "" && q.Get("scope") != "mcp" {
+		fail(w, 400, "invalid_scope")
+		return
+	}
+	if q.Get("resource") != s.resource() {
 		fail(w, 400, "invalid_target")
 		return
 	}
@@ -420,7 +523,20 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	case "authorization_code":
 		h := digest(q.Get("code"))
 		c, ok := s.state.Codes[h]
-		if !ok || c.Client != cid || c.Redirect != q.Get("redirect_uri") || !s.now().Before(c.Until) || !verifierRE.MatchString(q.Get("code_verifier")) || oauth2.S256ChallengeFromVerifier(q.Get("code_verifier")) != c.Challenge {
+		if !ok {
+			for k, g := range s.state.Grants {
+				if g.Client == cid && g.Code == h {
+					delete(s.state.Grants, k)
+					if s.save() != nil {
+						fail(w, 503, "temporarily_unavailable")
+						return
+					}
+				}
+			}
+			fail(w, 400, "invalid_grant")
+			return
+		}
+		if c.Client != cid || c.Redirect != q.Get("redirect_uri") || !s.now().Before(c.Until) || !verifierRE.MatchString(q.Get("code_verifier")) || oauth2.S256ChallengeFromVerifier(q.Get("code_verifier")) != c.Challenge {
 			fail(w, 400, "invalid_grant")
 			return
 		}
@@ -430,7 +546,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id = random()
-		g = grant{Client: cid, Resource: c.Resource, Until: s.now().Add(30 * 24 * time.Hour)}
+		g = grant{Client: cid, Resource: c.Resource, Code: h, Until: s.now().Add(30 * 24 * time.Hour)}
 	case "refresh_token":
 		h := digest(q.Get("refresh_token"))
 		for k, v := range s.state.Grants {
@@ -439,7 +555,10 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 			}
 			if contains(v.Used, h) {
 				delete(s.state.Grants, k)
-				_ = s.save()
+				if s.save() != nil {
+					fail(w, 503, "temporarily_unavailable")
+					return
+				}
 				fail(w, 400, "invalid_grant")
 				return
 			}
@@ -448,7 +567,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 				g = v
 			}
 		}
-		if id == "" || !s.now().Before(g.Until) || len(g.Used) >= 1000 {
+		if id == "" || g.Resource != s.resource() || !s.now().Before(g.Until) || len(g.Used) >= 1000 {
 			fail(w, 400, "invalid_grant")
 			return
 		}
@@ -473,6 +592,10 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	jsonReply(w, 200, map[string]any{"access_token": access, "refresh_token": refresh, "token_type": "Bearer", "expires_in": int(g.AccessUntil.Sub(s.now()).Seconds()), "scope": "mcp"})
 }
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.state.Clients[r.PostForm.Get("client_id")]; !ok || r.Header.Get("Authorization") != "" || r.PostForm.Get("client_secret") != "" || r.PostForm.Get("client_assertion") != "" {
+		fail(w, 400, "invalid_client")
+		return
+	}
 	h := digest(r.PostForm.Get("token"))
 	for id, g := range s.state.Grants {
 		if g.Client == r.PostForm.Get("client_id") && (g.Access == h || g.Refresh == h || contains(g.Used, h)) {
@@ -484,4 +607,31 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(200)
+}
+
+// Only call after exact client and redirect validation.
+func (s *Server) authorizationError(w http.ResponseWriter, r *http.Request, q url.Values, code string) {
+	dest, _ := url.Parse(q.Get("redirect_uri"))
+	values := dest.Query()
+	for _, k := range []string{"code", "error", "error_description", "state", "iss"} {
+		values.Del(k)
+	}
+	values.Set("error", code)
+	values.Set("iss", s.cfg.Issuer)
+	if q.Has("state") {
+		values.Set("state", q.Get("state"))
+	}
+	dest.RawQuery = values.Encode()
+	http.Redirect(w, r, dest.String(), 303)
+}
+
+// RequestAllowed applies canonical Host/Origin checks to native OAuth MCP calls.
+// Static Bearer callers retain their existing transport allowlist behavior.
+func (s *Server) RequestAllowed(r *http.Request) bool {
+	u, _ := url.Parse(s.cfg.Issuer)
+	if r.Host != u.Host {
+		return false
+	}
+	origins, sent := r.Header["Origin"]
+	return !sent || (len(origins) == 1 && origins[0] == s.cfg.Issuer)
 }

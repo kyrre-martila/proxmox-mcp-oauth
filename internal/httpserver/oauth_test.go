@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -18,10 +19,10 @@ import (
 )
 
 func TestNativeOAuthMCP(t *testing.T) {
-	hash, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.MinCost)
+	hash, _ := bcrypt.GenerateFromPassword([]byte("password"), 10)
 	dir := t.TempDir()
 	_ = os.Chmod(dir, 0700)
-	cfg := config.HTTP{AuthToken: "legacy-static-token", OAuth: oauth.Config{Issuer: "https://mcp.example", AdminHash: string(hash), Directory: dir, Redirects: []string{"https://chatgpt.com/connector_platform/oauth_redirect"}}}
+	cfg := config.HTTP{AuthToken: "legacy-static-token", OAuth: oauth.Config{Issuer: "https://mcp.example", AdminHash: string(hash), Directory: dir, Redirects: []string{"https://chatgpt.com/connector_platform_oauth_redirect"}}}
 	auth, e := oauth.New(cfg.OAuth)
 	if e != nil {
 		t.Fatal(e)
@@ -51,7 +52,7 @@ func TestNativeOAuthMCP(t *testing.T) {
 	if w.Code != 401 || !strings.Contains(w.Header().Get("WWW-Authenticate"), "oauth-protected-resource/mcp") {
 		t.Fatal(w.Code, w.Header())
 	}
-	w = do("POST", "/oauth/register", `{"redirect_uris":["https://chatgpt.com/connector_platform/oauth_redirect"]}`, "", nil)
+	w = do("POST", "/oauth/register", `{"redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"],"token_endpoint_auth_method":"none"}`, "", nil)
 	var result map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &result)
 	id, ok := result["client_id"].(string)
@@ -84,5 +85,40 @@ func TestNativeOAuthMCP(t *testing.T) {
 	w = do("POST", "/mcp", initialize, "invalid", nil)
 	if w.Code != 401 {
 		t.Fatal(w.Code)
+	}
+	// Force a failed snapshot: OAuth fails closed, static Bearer stays available.
+	path := filepath.Join(dir, "state.json")
+	if e = os.Remove(path); e != nil {
+		t.Fatal(e)
+	}
+	if e = os.Mkdir(path, 0700); e != nil {
+		t.Fatal(e)
+	}
+	w = do("POST", "/oauth/revoke", url.Values{"client_id": {id}, "token": {token}}.Encode(), "", nil)
+	if w.Code != 503 {
+		t.Fatal(w.Code)
+	}
+	if w = do("POST", "/mcp", initialize, token, nil); w.Code != 401 || !strings.Contains(w.Header().Get("WWW-Authenticate"), "invalid_token") {
+		t.Fatal(w.Code, w.Header())
+	}
+	if w = do("POST", "/mcp", initialize, cfg.AuthToken, nil); w.Code != 200 {
+		t.Fatal("OAuth failure broke static auth", w.Code)
+	}
+}
+
+func TestOAuthWithoutConfigStillRequiresAuthentication(t *testing.T) {
+	hash, _ := bcrypt.GenerateFromPassword([]byte("password"), 10)
+	dir := t.TempDir()
+	_ = os.Chmod(dir, 0700)
+	auth, e := oauth.New(oauth.Config{Issuer: "https://mcp.example", AdminHash: string(hash), Directory: dir, Redirects: []string{"https://chatgpt.com/connector_platform_oauth_redirect"}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer auth.Close()
+	h := HandlerWithOAuth(config.HTTP{}, mcp.NewServer(&mcp.Implementation{Name: "test", Version: "1"}, nil), auth)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "https://mcp.example/mcp", strings.NewReader("{}")))
+	if w.Code != 401 {
+		t.Fatal("OAuth handler accepted unauthenticated request")
 	}
 }

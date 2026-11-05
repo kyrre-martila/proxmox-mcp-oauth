@@ -158,15 +158,23 @@ func HandlerWithOAuth(cfg config.HTTP, server *mcp.Server, auth *oauth.Server) h
 			}
 		}
 		authorized := cfg.AuthToken != "" && tokenMatches(r.Header.Get("Authorization"), cfg.AuthToken)
-		if auth != nil {
+		if auth != nil && !authorized {
 			if m := bearerRe.FindStringSubmatch(r.Header.Get("Authorization")); m != nil {
-				authorized = authorized || auth.Valid(m[1])
+				if !auth.RequestAllowed(r) {
+					rpcError(w, http.StatusForbidden, "Host or Origin is not allowed")
+					return
+				}
+				authorized = auth.Valid(m[1])
 			}
 		}
-		if (cfg.AuthToken != "" || cfg.OAuth.Enabled()) && !authorized {
+		if (cfg.AuthToken != "" || cfg.OAuth.Enabled() || auth != nil) && !authorized {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			if auth != nil {
-				w.Header().Set("WWW-Authenticate", auth.Challenge())
+				challenge := auth.Challenge()
+				if r.Header.Get("Authorization") != "" {
+					challenge += `, error="invalid_token"`
+				}
+				w.Header().Set("WWW-Authenticate", challenge)
 			}
 			rpcError(w, http.StatusUnauthorized, "Unauthorized")
 			return

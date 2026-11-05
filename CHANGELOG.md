@@ -8,7 +8,7 @@ For proxmox-mcp, the "public API" is the set of tool names, their arguments, the
 
 ### Added
 
-- Optional native MCP OAuth with administrator consent, PKCE, discovery, dynamic client registration, rotating tokens and persistent revocation; static Bearer authentication remains supported.
+- Optional native MCP OAuth with administrator consent, PKCE, discovery, dynamic client registration, rotating tokens, restricted ChatGPT CIMD and fail-closed persistent revocation; static Bearer authentication remains supported.
 
 ## [0.5.1] - 2026-10-22
 
