@@ -1,0 +1,487 @@
+// Package oauth provides the optional single-administrator MCP authorization server.
+package oauth
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html/template"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gofrs/flock"
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/oauth2"
+	"golang.org/x/time/rate"
+)
+
+type Config struct {
+	Issuer, AdminHash, Directory string
+	Redirects                    []string
+}
+
+func (c Config) Enabled() bool { return c.Issuer != "" }
+func (c Config) Validate() error {
+	if !c.Enabled() {
+		if c.AdminHash != "" || c.Directory != "" || len(c.Redirects) > 0 {
+			return errors.New("partial OAuth configuration: MCP_OAUTH_ISSUER required")
+		}
+		return nil
+	}
+	u, e := url.Parse(c.Issuer)
+	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("MCP_OAUTH_ISSUER must be an HTTPS origin without a trailing slash")
+	}
+	if _, e = bcrypt.Cost([]byte(c.AdminHash)); e != nil {
+		return errors.New("MCP_OAUTH_ADMIN_HASH must be a bcrypt password hash")
+	}
+	if !filepath.IsAbs(c.Directory) || len(c.Redirects) == 0 {
+		return errors.New("OAuth requires an absolute state directory and exact redirect allowlist")
+	}
+	for _, s := range c.Redirects {
+		u, e := url.Parse(s)
+		if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
+			return errors.New("OAuth redirect allowlist must contain exact HTTPS URLs")
+		}
+	}
+	return nil
+}
+
+type client struct {
+	Redirects []string `json:"redirect_uris"`
+	Name      string   `json:"client_name"`
+}
+type grant struct {
+	Client, Resource, Access, Refresh string
+	Used                              []string
+	AccessUntil, Until                time.Time
+}
+type code struct {
+	Client, Redirect, Challenge, Resource string
+	Until                                 time.Time
+}
+type state struct {
+	Clients map[string]client
+	Codes   map[string]code
+	Grants  map[string]grant
+}
+type pending struct {
+	Query  url.Values
+	Cookie string
+	Until  time.Time
+}
+type Server struct {
+	cfg     Config
+	mu      sync.Mutex
+	state   state
+	pending map[string]pending
+	lock    *flock.Flock
+	limit   *rate.Limiter
+	now     func() time.Time
+	broken  bool
+}
+
+func random() string { return base64.RawURLEncoding.EncodeToString(randBytes()) }
+func randBytes() []byte {
+	b := make([]byte, 32)
+	if _, e := rand.Read(b); e != nil {
+		panic(e)
+	}
+	return b
+}
+func digest(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
+func New(c Config) (*Server, error) {
+	if e := c.Validate(); e != nil {
+		return nil, e
+	}
+	if !c.Enabled() {
+		return nil, errors.New("OAuth disabled")
+	}
+	if e := os.MkdirAll(c.Directory, 0700); e != nil {
+		return nil, e
+	}
+	info, e := os.Lstat(c.Directory)
+	if e != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
+		return nil, errors.New("OAuth state directory must be private (0700)")
+	}
+	f := flock.New(filepath.Join(c.Directory, "lock"))
+	locked, e := f.TryLock()
+	if e != nil || !locked {
+		return nil, errors.New("OAuth state already in use")
+	}
+	s := &Server{cfg: c, lock: f, pending: map[string]pending{}, limit: rate.NewLimiter(2, 10), now: time.Now}
+	s.state = state{map[string]client{}, map[string]code{}, map[string]grant{}}
+	b, e := os.ReadFile(filepath.Join(c.Directory, "state.json"))
+	if e == nil {
+		e = json.Unmarshal(b, &s.state)
+	}
+	if e != nil && !os.IsNotExist(e) {
+		s.Close()
+		return nil, errors.New("cannot load OAuth state")
+	}
+	if s.state.Clients == nil || s.state.Codes == nil || s.state.Grants == nil {
+		s.Close()
+		return nil, errors.New("invalid OAuth state")
+	}
+	return s, nil
+}
+func (s *Server) Close() error { return s.lock.Close() }
+func (s *Server) save() (err error) {
+	defer func() {
+		if err != nil {
+			s.broken = true
+		}
+	}()
+	b, e := json.Marshal(s.state)
+	if e != nil {
+		return e
+	}
+	f, e := os.CreateTemp(s.cfg.Directory, ".state-")
+	if e != nil {
+		return e
+	}
+	defer os.Remove(f.Name())
+	if _, e = f.Write(b); e == nil {
+		e = f.Sync()
+	}
+	ce := f.Close()
+	if e == nil {
+		e = ce
+	}
+	if e != nil {
+		return e
+	}
+	if e = os.Rename(f.Name(), filepath.Join(s.cfg.Directory, "state.json")); e != nil {
+		return e
+	}
+	d, e := os.Open(s.cfg.Directory)
+	if e != nil {
+		return e
+	}
+	defer d.Close()
+	return d.Sync()
+}
+func jsonReply(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+func fail(w http.ResponseWriter, status int, code string) {
+	jsonReply(w, status, map[string]string{"error": code})
+}
+func (s *Server) resource() string { return s.cfg.Issuer + "/mcp" }
+func (s *Server) Challenge() string {
+	return fmt.Sprintf("Bearer resource_metadata=%q", s.cfg.Issuer+"/.well-known/oauth-protected-resource/mcp")
+}
+func (s *Server) Valid(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken {
+		return false
+	}
+	h := digest(token)
+	for _, g := range s.state.Grants {
+		if g.Access == h && s.now().Before(g.AccessUntil) && s.now().Before(g.Until) && g.Resource == s.resource() {
+			return true
+		}
+	}
+	return false
+}
+func (s *Server) Register(m *http.ServeMux) {
+	for _, p := range []string{"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-authorization-server", "/oauth/register", "/oauth/authorize", "/oauth/token", "/oauth/revoke"} {
+		m.Handle(p, s)
+	}
+}
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+	u, _ := url.Parse(s.cfg.Issuer)
+	if r.Host != u.Host {
+		fail(w, 403, "invalid_request")
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/.well-known/") {
+		if r.Method != "GET" {
+			fail(w, 405, "invalid_request")
+			return
+		}
+		if strings.Contains(r.URL.Path, "oauth-protected-resource") {
+			jsonReply(w, 200, map[string]any{"resource": s.resource(), "authorization_servers": []string{s.cfg.Issuer}, "scopes_supported": []string{"mcp"}, "bearer_methods_supported": []string{"header"}})
+		} else {
+			jsonReply(w, 200, map[string]any{"issuer": s.cfg.Issuer, "authorization_endpoint": s.cfg.Issuer + "/oauth/authorize", "token_endpoint": s.cfg.Issuer + "/oauth/token", "registration_endpoint": s.cfg.Issuer + "/oauth/register", "revocation_endpoint": s.cfg.Issuer + "/oauth/revoke", "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "code_challenge_methods_supported": []string{"S256"}, "token_endpoint_auth_methods_supported": []string{"none"}, "scopes_supported": []string{"mcp"}, "authorization_response_iss_parameter_supported": true})
+		}
+		return
+	}
+	if !s.limit.Allow() {
+		fail(w, 429, "temporarily_unavailable")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16384)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken {
+		fail(w, 503, "temporarily_unavailable")
+		return
+	}
+	for k, v := range s.pending {
+		if !s.now().Before(v.Until) {
+			delete(s.pending, k)
+		}
+	}
+	for k, v := range s.state.Codes {
+		if !s.now().Before(v.Until) {
+			delete(s.state.Codes, k)
+		}
+	}
+	for k, v := range s.state.Grants {
+		if !s.now().Before(v.Until) {
+			delete(s.state.Grants, k)
+		}
+	}
+	if r.URL.Path == "/oauth/register" {
+		s.registration(w, r)
+		return
+	}
+	if r.URL.Path == "/oauth/authorize" {
+		s.authorize(w, r)
+		return
+	}
+	if r.Method != "POST" || r.URL.RawQuery != "" {
+		fail(w, 405, "invalid_request")
+		return
+	}
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") || r.ParseForm() != nil || !single(r.PostForm) {
+		fail(w, 400, "invalid_request")
+		return
+	}
+	if r.URL.Path == "/oauth/revoke" {
+		s.revoke(w, r)
+		return
+	}
+	s.token(w, r)
+}
+func single(v url.Values) bool {
+	for _, a := range v {
+		if len(a) != 1 {
+			return false
+		}
+	}
+	return true
+}
+func contains(a []string, b string) bool {
+	for _, v := range a {
+		if v == b {
+			return true
+		}
+	}
+	return false
+}
+func (s *Server) registration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		fail(w, 405, "invalid_request")
+		return
+	}
+	var v struct {
+		Redirects []string `json:"redirect_uris"`
+		Name      string   `json:"client_name"`
+		Auth      string   `json:"token_endpoint_auth_method"`
+		Grants    []string `json:"grant_types"`
+		Responses []string `json:"response_types"`
+		Scope     string   `json:"scope"`
+	}
+	if json.NewDecoder(r.Body).Decode(&v) != nil || len(v.Redirects) == 0 || len(v.Redirects) > 5 || len(v.Name) > 128 || (v.Auth != "" && v.Auth != "none") || (v.Scope != "" && v.Scope != "mcp") {
+		fail(w, 400, "invalid_client_metadata")
+		return
+	}
+	for _, g := range v.Grants {
+		if g != "authorization_code" && g != "refresh_token" {
+			fail(w, 400, "invalid_client_metadata")
+			return
+		}
+	}
+	for _, g := range v.Responses {
+		if g != "code" {
+			fail(w, 400, "invalid_client_metadata")
+			return
+		}
+	}
+	for _, u := range v.Redirects {
+		if !contains(s.cfg.Redirects, u) {
+			fail(w, 400, "invalid_redirect_uri")
+			return
+		}
+	}
+	if len(s.state.Clients) >= 100 {
+		fail(w, 503, "temporarily_unavailable")
+		return
+	}
+	id := random()
+	s.state.Clients[id] = client{v.Redirects, v.Name}
+	if s.save() != nil {
+		delete(s.state.Clients, id)
+		fail(w, 503, "temporarily_unavailable")
+		return
+	}
+	jsonReply(w, 201, map[string]any{"client_id": id, "client_name": v.Name, "redirect_uris": v.Redirects, "token_endpoint_auth_method": "none", "grant_types": []string{"authorization_code", "refresh_token"}, "response_types": []string{"code"}, "scope": "mcp"})
+}
+
+var challengeRE = regexp.MustCompile("^[A-Za-z0-9_-]{43}$")
+var verifierRE = regexp.MustCompile("^[A-Za-z0-9._~-]{43,128}$")
+var consent = template.Must(template.New("consent").Parse(`<!doctype html><title>Authorize Proxmox MCP</title><h1>Authorize Proxmox MCP</h1><p>Client: {{.Name}}</p><p>Redirect: {{.Redirect}}</p><p>Allow access to all currently enabled Proxmox tools (scope mcp). Server permission controls still apply.</p><form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="{{.ID}}"><label>Administrator password <input type="password" name="password" required autocomplete="current-password"></label><button name="decision" value="allow">Authorize</button><button name="decision" value="deny" formnovalidate>Deny</button></form>`))
+
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		q, e := url.ParseQuery(r.URL.RawQuery)
+		c, ok := s.state.Clients[q.Get("client_id")]
+		if e != nil || len(r.URL.RawQuery) > 8192 || !single(q) || !ok || !contains(c.Redirects, q.Get("redirect_uri")) || q.Get("resource") != s.resource() || q.Get("response_type") != "code" || q.Get("code_challenge_method") != "S256" || !challengeRE.MatchString(q.Get("code_challenge")) || (q.Get("scope") != "" && q.Get("scope") != "mcp") || len(q.Get("state")) > 1024 {
+			fail(w, 400, "invalid_request")
+			return
+		}
+		if len(s.pending) >= 100 {
+			fail(w, 503, "temporarily_unavailable")
+			return
+		}
+		id, cookie := random(), random()
+		s.pending[digest(id)] = pending{q, digest(cookie), s.now().Add(5 * time.Minute)}
+		http.SetCookie(w, &http.Cookie{Name: "__Host-mcp-consent", Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 300})
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = consent.Execute(w, struct{ Name, Redirect, ID string }{c.Name, q.Get("redirect_uri"), id})
+		return
+	}
+	if r.Method != "POST" || r.URL.RawQuery != "" || r.Header.Get("Origin") != s.cfg.Issuer || r.ParseForm() != nil || !single(r.PostForm) {
+		fail(w, 403, "access_denied")
+		return
+	}
+	id := digest(r.PostForm.Get("request"))
+	p, ok := s.pending[id]
+	cookie, e := r.Cookie("__Host-mcp-consent")
+	if !ok || e != nil || subtle.ConstantTimeCompare([]byte(p.Cookie), []byte(digest(cookie.Value))) != 1 || !s.now().Before(p.Until) {
+		fail(w, 403, "access_denied")
+		return
+	}
+	delete(s.pending, id)
+	q := p.Query
+	dest, _ := url.Parse(q.Get("redirect_uri"))
+	values := dest.Query()
+	values.Set("state", q.Get("state"))
+	values.Set("iss", s.cfg.Issuer)
+	if r.PostForm.Get("decision") == "deny" {
+		values.Set("error", "access_denied")
+	} else {
+		if r.PostForm.Get("decision") != "allow" || bcrypt.CompareHashAndPassword([]byte(s.cfg.AdminHash), []byte(r.PostForm.Get("password"))) != nil {
+			fail(w, 403, "access_denied")
+			return
+		}
+		if len(s.state.Codes) >= 100 {
+			fail(w, 503, "temporarily_unavailable")
+			return
+		}
+		raw := random()
+		hash := digest(raw)
+		s.state.Codes[hash] = code{q.Get("client_id"), q.Get("redirect_uri"), q.Get("code_challenge"), q.Get("resource"), s.now().Add(2 * time.Minute)}
+		if s.save() != nil {
+			delete(s.state.Codes, hash)
+			fail(w, 503, "temporarily_unavailable")
+			return
+		}
+		values.Set("code", raw)
+	}
+	dest.RawQuery = values.Encode()
+	http.Redirect(w, r, dest.String(), 303)
+}
+func (s *Server) token(w http.ResponseWriter, r *http.Request) {
+	q := r.PostForm
+	cid := q.Get("client_id")
+	if _, ok := s.state.Clients[cid]; !ok || r.Header.Get("Authorization") != "" || q.Get("client_secret") != "" {
+		fail(w, 401, "invalid_client")
+		return
+	}
+	if q.Get("resource") != s.resource() || (q.Get("scope") != "" && q.Get("scope") != "mcp") {
+		fail(w, 400, "invalid_target")
+		return
+	}
+	var g grant
+	id := ""
+	switch q.Get("grant_type") {
+	case "authorization_code":
+		h := digest(q.Get("code"))
+		c, ok := s.state.Codes[h]
+		if !ok || c.Client != cid || c.Redirect != q.Get("redirect_uri") || !s.now().Before(c.Until) || !verifierRE.MatchString(q.Get("code_verifier")) || oauth2.S256ChallengeFromVerifier(q.Get("code_verifier")) != c.Challenge {
+			fail(w, 400, "invalid_grant")
+			return
+		}
+		delete(s.state.Codes, h)
+		if len(s.state.Grants) >= 1000 {
+			fail(w, 503, "temporarily_unavailable")
+			return
+		}
+		id = random()
+		g = grant{Client: cid, Resource: c.Resource, Until: s.now().Add(30 * 24 * time.Hour)}
+	case "refresh_token":
+		h := digest(q.Get("refresh_token"))
+		for k, v := range s.state.Grants {
+			if v.Client != cid {
+				continue
+			}
+			if contains(v.Used, h) {
+				delete(s.state.Grants, k)
+				_ = s.save()
+				fail(w, 400, "invalid_grant")
+				return
+			}
+			if v.Refresh == h {
+				id = k
+				g = v
+			}
+		}
+		if id == "" || !s.now().Before(g.Until) || len(g.Used) >= 1000 {
+			fail(w, 400, "invalid_grant")
+			return
+		}
+		g.Used = append(g.Used, g.Refresh)
+	default:
+		fail(w, 400, "unsupported_grant_type")
+		return
+	}
+	access, refresh := random(), random()
+	g.Access = digest(access)
+	g.Refresh = digest(refresh)
+	g.AccessUntil = s.now().Add(15 * time.Minute)
+	if g.Until.Before(g.AccessUntil) {
+		g.AccessUntil = g.Until
+	}
+	s.state.Grants[id] = g
+	if s.save() != nil {
+		delete(s.state.Grants, id)
+		fail(w, 503, "temporarily_unavailable")
+		return
+	}
+	jsonReply(w, 200, map[string]any{"access_token": access, "refresh_token": refresh, "token_type": "Bearer", "expires_in": int(g.AccessUntil.Sub(s.now()).Seconds()), "scope": "mcp"})
+}
+func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
+	h := digest(r.PostForm.Get("token"))
+	for id, g := range s.state.Grants {
+		if g.Client == r.PostForm.Get("client_id") && (g.Access == h || g.Refresh == h || contains(g.Used, h)) {
+			delete(s.state.Grants, id)
+		}
+	}
+	if s.save() != nil {
+		fail(w, 503, "temporarily_unavailable")
+		return
+	}
+	w.WriteHeader(200)
+}

@@ -22,6 +22,7 @@ import (
 
 	"github.com/mattoddie/proxmox-mcp/internal/config"
 	"github.com/mattoddie/proxmox-mcp/internal/httpserver"
+	"github.com/mattoddie/proxmox-mcp/internal/oauth"
 	"github.com/mattoddie/proxmox-mcp/internal/proxmox"
 	"github.com/mattoddie/proxmox-mcp/internal/tools"
 )
@@ -111,12 +112,21 @@ func serve() error {
 		}
 		return err
 	}
+	var authServer *oauth.Server
+	if cfg.HTTP.OAuth.Enabled() {
+		authServer, err = oauth.New(cfg.HTTP.OAuth)
+		if err != nil {
+			return err
+		}
+		defer authServer.Close()
+	}
 	ln, err := httpserver.Listen(cfg.HTTP)
 	if err != nil {
 		return err
 	}
+	defer ln.Close()
 	srv := &http.Server{
-		Handler:           httpserver.Handler(cfg.HTTP, server),
+		Handler:           httpserver.HandlerWithOAuth(cfg.HTTP, server, authServer),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,
