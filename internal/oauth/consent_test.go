@@ -39,7 +39,7 @@ func TestConsentHeadersAndSubmission(t *testing.T) {
 	// Hash the rendered bytes, so whitespace or template transformations cannot
 	// silently break the styles or the show/hide control in a browser.
 	for tag, directive := range map[string]string{"style": "style-src", "script": "script-src"} {
-		blocks := regexp.MustCompile("(?s)<" + tag + ">(.*?)</" + tag + ">").FindAllStringSubmatch(w.Body.String(), -1)
+		blocks := regexp.MustCompile("(?s)<"+tag+">(.*?)</"+tag+">").FindAllStringSubmatch(w.Body.String(), -1)
 		if len(blocks) != 1 {
 			t.Fatalf("expected one %s block", tag)
 		}
