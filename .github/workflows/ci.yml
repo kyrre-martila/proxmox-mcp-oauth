@@ -157,6 +157,9 @@ jobs:
           # With one, stdio starts and exits cleanly when stdin closes.
           docker run --rm -e MCP_TRANSPORT=stdio -e PROXMOX_URL=https://192.0.2.1:8006 -e PROXMOX_VERIFY_SSL=false -e PROXMOX_API_TOKEN='ci@pam!ci=ci' proxmox-mcp:ci </dev/null
 
+      - name: Native OAuth runtime (persistent state, non-root, read-only)
+        run: python3 scripts/oauth-docker-smoke.py proxmox-mcp:ci
+
       - name: Build all platforms
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
