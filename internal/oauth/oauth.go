@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
 	"mime"
 	"net/http"
@@ -407,14 +406,13 @@ func (s *Server) registration(w http.ResponseWriter, r *http.Request) {
 
 var challengeRE = regexp.MustCompile("^[A-Za-z0-9_-]{43}$")
 var verifierRE = regexp.MustCompile("^[A-Za-z0-9._~-]{43,128}$")
-var consent = template.Must(template.New("consent").Parse(`<!doctype html><title>Authorize Proxmox MCP</title><h1>Authorize Proxmox MCP</h1><p>Client (unverified display name): {{.Name}}</p><p>Client ID: {{.ClientID}}</p><p>Redirect: {{.Redirect}}</p><p>Allow access to all currently enabled Proxmox tools (scope mcp). Server permission controls still apply.</p><form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="{{.ID}}"><label>Administrator password <input type="password" name="password" required autocomplete="current-password"></label><button name="decision" value="allow">Authorize</button><button name="decision" value="deny" formnovalidate>Deny</button></form>`))
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		q, e := url.ParseQuery(r.URL.RawQuery)
 		c, ok := s.state.Clients[q.Get("client_id")]
 		if e != nil || len(r.URL.RawQuery) > 8192 || !single(q) || !ok || !contains(c.Redirects, q.Get("redirect_uri")) || !contains(s.cfg.Redirects, q.Get("redirect_uri")) || len(q.Get("state")) > 1024 {
-			fail(w, 400, "invalid_request")
+			consentFail(w, 400, "invalid_request")
 			return
 		}
 		errorCode := ""
@@ -433,25 +431,29 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(s.pending) >= 100 {
-			fail(w, 503, "temporarily_unavailable")
+			consentFail(w, 503, "temporarily_unavailable")
 			return
 		}
 		id, cookie := random(), random()
 		s.pending[digest(id)] = pending{q, digest(cookie), s.now().Add(5 * time.Minute)}
 		http.SetCookie(w, &http.Cookie{Name: "__Host-mcp-consent", Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 300})
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// no-referrer makes native form submissions send Origin: null in Chrome.
+		// Preserve the same-origin Origin required by the strict POST check below.
+		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("Content-Security-Policy", consentPolicy())
 		_ = consent.Execute(w, struct{ Name, Redirect, ID, ClientID string }{c.Name, q.Get("redirect_uri"), id, q.Get("client_id")})
 		return
 	}
 	if r.Method != "POST" || r.URL.RawQuery != "" || (len(r.Header.Values("Origin")) != 1 || r.Header.Get("Origin") != s.cfg.Issuer) || r.ParseForm() != nil || !single(r.PostForm) {
-		fail(w, 403, "access_denied")
+		consentFail(w, 403, "access_denied")
 		return
 	}
 	id := digest(r.PostForm.Get("request"))
 	p, ok := s.pending[id]
 	cookie, e := r.Cookie("__Host-mcp-consent")
 	if !ok || e != nil || subtle.ConstantTimeCompare([]byte(p.Cookie), []byte(digest(cookie.Value))) != 1 || !s.now().Before(p.Until) {
-		fail(w, 403, "access_denied")
+		consentFail(w, 403, "access_denied")
 		return
 	}
 	delete(s.pending, id)
@@ -470,7 +472,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	} else {
 		if !s.passwordLimit.Allow() {
 			w.Header().Set("Retry-After", "3")
-			fail(w, 429, "temporarily_unavailable")
+			consentFail(w, 429, "temporarily_unavailable")
 			return
 		}
 		// The one-time request was consumed under lock; bcrypt must not block MCP.
@@ -478,15 +480,15 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		err := bcrypt.CompareHashAndPassword([]byte(s.cfg.AdminHash), []byte(r.PostForm.Get("password")))
 		s.mu.Lock()
 		if s.broken {
-			fail(w, 503, "temporarily_unavailable")
+			consentFail(w, 503, "temporarily_unavailable")
 			return
 		}
 		if r.PostForm.Get("decision") != "allow" || len(r.PostForm.Get("password")) > 72 || err != nil {
-			fail(w, 403, "access_denied")
+			consentFail(w, 403, "access_denied")
 			return
 		}
 		if len(s.state.Codes) >= 100 {
-			fail(w, 503, "temporarily_unavailable")
+			consentFail(w, 503, "temporarily_unavailable")
 			return
 		}
 		raw := random()
@@ -494,7 +496,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		s.state.Codes[hash] = code{q.Get("client_id"), q.Get("redirect_uri"), q.Get("code_challenge"), q.Get("resource"), s.now().Add(2 * time.Minute)}
 		if s.save() != nil {
 			delete(s.state.Codes, hash)
-			fail(w, 503, "temporarily_unavailable")
+			consentFail(w, 503, "temporarily_unavailable")
 			return
 		}
 		values.Set("code", raw)
@@ -635,3 +637,4 @@ func (s *Server) RequestAllowed(r *http.Request) bool {
 	origins, sent := r.Header["Origin"]
 	return !sent || (len(origins) == 1 && origins[0] == s.cfg.Issuer)
 }
+
