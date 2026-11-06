@@ -100,6 +100,11 @@ try:
         code_challenge=challenge, state="smoke"))
     status, headers, body = request("/oauth/authorize?" + query)
     assert status == 200
+    assert headers["referrer-policy"] == "same-origin"
+    assert headers["cache-control"] == "no-store"
+    assert "default-src 'none'" in headers["content-security-policy"]
+    assert "unsafe-inline" not in headers["content-security-policy"]
+    assert all(flag in headers["set-cookie"] for flag in ("Secure", "HttpOnly", "SameSite=Strict"))
     csrf = re.search(r'name="request" value="([^"]+)"', body)[1]
     cookie = headers["set-cookie"].split(";")[0]
     status, headers, _ = request("/oauth/authorize", {
@@ -136,3 +141,4 @@ try:
 finally:
     subprocess.run(["docker", "rm", "-f", NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["docker", "volume", "rm", STATE, SECRETS], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
