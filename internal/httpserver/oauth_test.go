@@ -22,7 +22,22 @@ func TestNativeOAuthMCP(t *testing.T) {
 	hash, _ := bcrypt.GenerateFromPassword([]byte("password"), 10)
 	dir := t.TempDir()
 	_ = os.Chmod(dir, 0700)
-	cfg := config.HTTP{AuthToken: "legacy-static-token", OAuth: oauth.Config{Issuer: "https://mcp.example", AdminHash: string(hash), Directory: dir, Redirects: []string{"https://chatgpt.com/connector_platform_oauth_redirect"}}}
+	// Exercise the real configuration loader with an htpasswd-style bcrypt hash
+	// and multiple trailing line breaks, then complete authorization and MCP calls.
+	hashPath := filepath.Join(t.TempDir(), "admin")
+	if err := os.WriteFile(hashPath, []byte(strings.Replace(string(hash), "$2a$", "$2y$", 1)+"\n\n\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(config.MapEnv(map[string]string{
+		"PROXMOX_URL": "http://pve:8006", "PROXMOX_API_TOKEN": "test@pve!test=public-fixture",
+		"MCP_TRANSPORT": "http", "MCP_AUTH_TOKEN": "legacy-static-token",
+		"MCP_OAUTH_ISSUER": "https://mcp.example", "MCP_OAUTH_ADMIN_HASH_FILE": hashPath,
+		"MCP_OAUTH_STATE_DIR": dir, "MCP_OAUTH_REDIRECT_URIS": "https://chatgpt.com/connector_platform_oauth_redirect",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := loaded.HTTP
 	auth, e := oauth.New(cfg.OAuth)
 	if e != nil {
 		t.Fatal(e)

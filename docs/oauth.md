@@ -147,13 +147,62 @@ Do not log authorization query strings, headers, bodies or token responses at
 your ingress. The application never logs OAuth credentials.
 
 
+## Authorization rejection diagnostics
+
+Rejected `POST /oauth/authorize` requests emit one structured JSON event to the
+server log (stderr in the container). For example:
+
+```json
+{"event":"oauth_authorization_rejected","reason":"password_verification_failed","status":403}
+```
+
+Only the fixed event name, a server-selected reason code and the HTTP status are
+logged. Passwords, hashes, cookies, request IDs, tokens, authorization codes,
+request bodies, headers and query parameters are never included. Public OAuth
+errors and consent failure descriptions remain generic. Successful approval and
+explicit denial do not emit rejection events.
+
+| Reason | Meaning |
+| --- | --- |
+| `invalid_host` | Host does not exactly match the configured issuer host. |
+| `invalid_origin` | Origin is missing, duplicated, opaque (`null`) or does not exactly match the issuer. |
+| `malformed_request` | Invalid content type, unreadable/oversized body, malformed/duplicate form values or a query string on the POST. |
+| `consent_request_missing` | Form has no nonempty consent request ID. |
+| `consent_request_unknown` | No pending request matches; includes replay, restart or expiry already removed by cleanup. |
+| `consent_request_expired` | The submitted pending request has reached its five-minute expiry. |
+| `consent_cookie_missing` | No usable consent cookie was supplied. |
+| `consent_cookie_mismatch` | Cookie does not match the pending request; opening another consent page in the same browser can replace it. |
+| `invalid_decision` | Decision is neither `allow` nor `deny`. |
+| `password_verification_failed` | bcrypt did not verify the submitted password. |
+| `password_too_long` | Submitted password exceeds bcrypt's 72-byte limit (bytes, not characters). |
+| `rate_limited` | General OAuth request limiter rejected the request. |
+| `password_rate_limited` | Administrator password attempt limiter rejected the request. |
+| `state_persistence_failed` | Saving authorization state failed, or an earlier persistence failure disabled OAuth. |
+| `authorization_capacity_exceeded` | The pending authorization code limit was reached. |
+
+Checks run in order and report the first rejection only. A 403 with a verified
+password does not establish a bcrypt failure: inspect the server-side reason.
+Keep ingress logging restricted as described above; do not enable body or cookie
+logging to troubleshoot consent. An unavailable request must be restarted from
+the client, because pending consent lives in one process and is consumed once.
+
+`MCP_OAUTH_ADMIN_HASH_FILE` takes precedence over `MCP_OAUTH_ADMIN_HASH`. The
+configuration loader already removes surrounding whitespace, including multiple
+LF or CRLF line breaks, from the hash file. Additional trailing newlines do not
+explain a password mismatch. The mounted file must contain only the bcrypt hash,
+without an htpasswd username prefix. `$2a$`, `$2b$` and htpasswd-style `$2y$` hashes
+are covered by regression tests. Submitted passwords are never trimmed; leading
+and trailing spaces remain significant. Invalid decisions and passwords over
+72 bytes are rejected before running bcrypt, while approval attempts retain the
+password rate limit and one-time consent consumption.
+
 ## Automated Docker verification
 
 Run python3 scripts/oauth-docker-smoke.py proxmox-mcp:ci after building the image.
 It creates and removes only uniquely named test containers and volumes. A pinned
 BusyBox helper prepares state ownership and a public test-only mounted hash;
 the application still runs in the distroless image as UID 65532, read-only, with
-all capabilities dropped. The test covers administrator consent, DCR, resource
+all capabilities dropped. The test covers a mounted hash with extra newlines, safe password rejection diagnostics, fresh administrator consent, DCR, resource
 binding, OAuth and static Bearer MCP calls, read-only tool listings, restart,
 refresh and durable revocation. It never calls a Proxmox API.
 

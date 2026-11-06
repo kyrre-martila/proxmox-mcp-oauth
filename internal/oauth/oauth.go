@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -95,6 +96,7 @@ type Server struct {
 	metadataHTTP      *http.Client
 	now               func() time.Time
 	broken            bool
+	diagnostics       *log.Logger
 }
 
 func random() string { return base64.RawURLEncoding.EncodeToString(randBytes()) }
@@ -125,7 +127,7 @@ func New(c Config) (*Server, error) {
 	if e != nil || !locked {
 		return nil, errors.New("OAuth state already in use")
 	}
-	s := &Server{cfg: c, lock: f, pending: map[string]pending{}, limit: rate.NewLimiter(10, 20), registrationLimit: rate.NewLimiter(rate.Every(10*time.Second), 5), passwordLimit: rate.NewLimiter(rate.Every(3*time.Second), 5), now: time.Now, metadataHTTP: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	s := &Server{diagnostics: log.Default(), cfg: c, lock: f, pending: map[string]pending{}, limit: rate.NewLimiter(10, 20), registrationLimit: rate.NewLimiter(rate.Every(10*time.Second), 5), passwordLimit: rate.NewLimiter(rate.Every(3*time.Second), 5), now: time.Now, metadataHTTP: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	s.state = state{Clients: map[string]client{}, Codes: map[string]code{}, Grants: map[string]grant{}}
 	if _, e := os.Lstat(filepath.Join(c.Directory, "pending-write")); e == nil || !os.IsNotExist(e) {
 		s.Close()
@@ -248,6 +250,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 	u, _ := url.Parse(s.cfg.Issuer)
 	if r.Host != u.Host {
+		s.postRejection(r, "invalid_host", 403)
 		fail(w, 403, "invalid_request")
 		return
 	}
@@ -269,6 +272,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !limiter.Allow() {
 		w.Header().Set("Retry-After", "10")
+		s.postRejection(r, "rate_limited", 429)
 		fail(w, 429, "temporarily_unavailable")
 		return
 	}
@@ -277,6 +281,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		b, e := io.ReadAll(r.Body)
 		if e != nil {
+			s.postRejection(r, "malformed_request", 400)
 			fail(w, 400, "invalid_request")
 			return
 		}
@@ -287,10 +292,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		media, _, e := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		if e != nil || media != want {
+			s.postRejection(r, "malformed_request", 400)
 			fail(w, 400, "invalid_request")
 			return
 		}
 		if want != "application/json" && (r.ParseForm() != nil || !single(r.PostForm)) {
+			s.postRejection(r, "malformed_request", 400)
 			fail(w, 400, "invalid_request")
 			return
 		}
@@ -310,6 +317,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.broken {
+		s.postRejection(r, "state_persistence_failed", 503)
 		fail(w, 503, "temporarily_unavailable")
 		return
 	}
@@ -321,7 +329,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.state.Clients[cid] = *resolved
 	}
+	// Keep only the submitted request until authorize can diagnose its expiry.
+	// Requests rejected before consent lookup still receive normal cleanup.
+	submittedConsent := ""
+	if r.Method == "POST" && r.URL.Path == "/oauth/authorize" && r.URL.RawQuery == "" && len(r.Header.Values("Origin")) == 1 && r.Header.Get("Origin") == s.cfg.Issuer {
+		submittedConsent = digest(r.PostForm.Get("request"))
+	}
 	for k, v := range s.pending {
+		if k == submittedConsent {
+			continue
+		}
 		if !s.now().Before(v.Until) {
 			delete(s.pending, k)
 		}
@@ -445,18 +462,40 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		_ = consent.Execute(w, struct{ Name, Redirect, ID, ClientID string }{c.Name, q.Get("redirect_uri"), id, q.Get("client_id")})
 		return
 	}
-	if r.Method != "POST" || r.URL.RawQuery != "" || (len(r.Header.Values("Origin")) != 1 || r.Header.Get("Origin") != s.cfg.Issuer) || r.ParseForm() != nil || !single(r.PostForm) {
-		consentFail(w, 403, "access_denied")
+	if r.Method != "POST" || r.URL.RawQuery != "" || r.ParseForm() != nil || !single(r.PostForm) {
+		s.rejectConsent(w, r, "malformed_request", 403, "access_denied")
+		return
+	}
+	if len(r.Header.Values("Origin")) != 1 || r.Header.Get("Origin") != s.cfg.Issuer {
+		s.rejectConsent(w, r, "invalid_origin", 403, "access_denied")
+		return
+	}
+	if r.PostForm.Get("request") == "" {
+		s.rejectConsent(w, r, "consent_request_missing", 403, "access_denied")
 		return
 	}
 	id := digest(r.PostForm.Get("request"))
 	p, ok := s.pending[id]
+	if !ok {
+		s.rejectConsent(w, r, "consent_request_unknown", 403, "access_denied")
+		return
+	}
+	if !s.now().Before(p.Until) {
+		delete(s.pending, id)
+		s.rejectConsent(w, r, "consent_request_expired", 403, "access_denied")
+		return
+	}
 	cookie, e := r.Cookie("__Host-mcp-consent")
-	if !ok || e != nil || subtle.ConstantTimeCompare([]byte(p.Cookie), []byte(digest(cookie.Value))) != 1 || !s.now().Before(p.Until) {
-		consentFail(w, 403, "access_denied")
+	if e != nil {
+		s.rejectConsent(w, r, "consent_cookie_missing", 403, "access_denied")
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(p.Cookie), []byte(digest(cookie.Value))) != 1 {
+		s.rejectConsent(w, r, "consent_cookie_mismatch", 403, "access_denied")
 		return
 	}
 	delete(s.pending, id)
+	decision := r.PostForm.Get("decision")
 	q := p.Query
 	dest, _ := url.Parse(q.Get("redirect_uri"))
 	values := dest.Query()
@@ -467,28 +506,38 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		values.Set("state", q.Get("state"))
 	}
 	values.Set("iss", s.cfg.Issuer)
-	if r.PostForm.Get("decision") == "deny" {
+	if decision == "deny" {
 		values.Set("error", "access_denied")
 	} else {
 		if !s.passwordLimit.Allow() {
 			w.Header().Set("Retry-After", "3")
-			consentFail(w, 429, "temporarily_unavailable")
+			s.rejectConsent(w, r, "password_rate_limited", 429, "temporarily_unavailable")
+			return
+		}
+		if decision != "allow" {
+			s.rejectConsent(w, r, "invalid_decision", 403, "access_denied")
+			return
+		}
+		password := r.PostForm.Get("password")
+		// bcrypt truncates long inputs when comparing; reject them before hashing.
+		if len(password) > 72 {
+			s.rejectConsent(w, r, "password_too_long", 403, "access_denied")
 			return
 		}
 		// The one-time request was consumed under lock; bcrypt must not block MCP.
 		s.mu.Unlock()
-		err := bcrypt.CompareHashAndPassword([]byte(s.cfg.AdminHash), []byte(r.PostForm.Get("password")))
+		err := bcrypt.CompareHashAndPassword([]byte(s.cfg.AdminHash), []byte(password))
 		s.mu.Lock()
 		if s.broken {
-			consentFail(w, 503, "temporarily_unavailable")
+			s.rejectConsent(w, r, "state_persistence_failed", 503, "temporarily_unavailable")
 			return
 		}
-		if r.PostForm.Get("decision") != "allow" || len(r.PostForm.Get("password")) > 72 || err != nil {
-			consentFail(w, 403, "access_denied")
+		if err != nil {
+			s.rejectConsent(w, r, "password_verification_failed", 403, "access_denied")
 			return
 		}
 		if len(s.state.Codes) >= 100 {
-			consentFail(w, 503, "temporarily_unavailable")
+			s.rejectConsent(w, r, "authorization_capacity_exceeded", 503, "temporarily_unavailable")
 			return
 		}
 		raw := random()
@@ -496,7 +545,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		s.state.Codes[hash] = code{q.Get("client_id"), q.Get("redirect_uri"), q.Get("code_challenge"), q.Get("resource"), s.now().Add(2 * time.Minute)}
 		if s.save() != nil {
 			delete(s.state.Codes, hash)
-			consentFail(w, 503, "temporarily_unavailable")
+			s.rejectConsent(w, r, "state_persistence_failed", 503, "temporarily_unavailable")
 			return
 		}
 		values.Set("code", raw)
@@ -637,4 +686,3 @@ func (s *Server) RequestAllowed(r *http.Request) bool {
 	origins, sent := r.Header["Origin"]
 	return !sent || (len(origins) == 1 && origins[0] == s.cfg.Issuer)
 }
-
