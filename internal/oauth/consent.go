@@ -5,14 +5,32 @@ import (
 	"encoding/base64"
 	"html/template"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
 // Only these static style/script blocks may execute; client data stays in
 // html/template's escaped text and attribute contexts.
-func consentPolicy() string {
+func consentPolicy(redirects []string) string {
+	// Chrome checks the form's redirect chain against the submitting page's CSP.
+	// Use only the server's validated configuration, never request parameters.
+	formAction := "'self'"
+	seen := map[string]bool{}
+	for _, redirect := range redirects {
+		u, err := url.Parse(redirect)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil ||
+			strings.ContainsAny(u.Host, "*;'\" \t\r\n") {
+			continue
+		}
+		origin := u.Scheme + "://" + u.Host
+		if !seen[origin] {
+			formAction += " " + origin
+			seen[origin] = true
+		}
+	}
 	style := sha256.Sum256([]byte(consentStyle))
 	script := sha256.Sum256([]byte(consentScript))
-	return "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; style-src 'sha256-" +
+	return "default-src 'none'; form-action " + formAction + "; frame-ancestors 'none'; base-uri 'none'; style-src 'sha256-" +
 		base64.StdEncoding.EncodeToString(style[:]) + "'; script-src 'sha256-" +
 		base64.StdEncoding.EncodeToString(script[:]) + "'"
 }

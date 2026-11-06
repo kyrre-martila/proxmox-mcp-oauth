@@ -28,6 +28,10 @@ func TestConsentHeadersAndSubmission(t *testing.T) {
 		}
 	}
 	csp := w.Header().Get("Content-Security-Policy")
+	callback, _ := url.Parse(s.cfg.Redirects[0])
+	if !strings.Contains(csp, "form-action 'self' "+callback.Scheme+"://"+callback.Host+";") {
+		t.Fatal("configured callback origin blocked")
+	}
 	for _, directive := range []string{"default-src 'none'", "form-action 'self'", "frame-ancestors 'none'", "base-uri 'none'"} {
 		if !strings.Contains(csp, directive) {
 			t.Errorf("missing CSP directive %q", directive)
@@ -83,6 +87,9 @@ func TestConsentHeadersAndSubmission(t *testing.T) {
 	if err != nil || w.Code != 303 {
 		t.Fatal("same-origin submission failed", w.Code)
 	}
+	if got := w.Header().Get("Content-Security-Policy"); got != "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'" {
+		t.Fatalf("POST response policy changed: %q", got)
+	}
 	q := dest.Query()
 	if q.Get("code") == "" || q.Get("state") != "original-state" || q.Get("iss") != s.cfg.Issuer {
 		t.Fatal("missing authorization response fields")
@@ -113,5 +120,46 @@ func TestConsentEscapesClientDetails(t *testing.T) {
 		if !strings.Contains(strings.ToLower(body), strings.ToLower(detail)) {
 			t.Errorf("missing consent detail %q", detail)
 		}
+	}
+}
+
+func TestConsentPolicyConfiguredOrigins(t *testing.T) {
+	redirects := []string{
+		"https://chatgpt.com/connector_platform_oauth_redirect",
+		"https://chatgpt.com/another/path?next=https://evil.example",
+		"https://client.example:8443/callback",
+	}
+	policy := consentPolicy(redirects)
+	wantForm := "form-action 'self' https://chatgpt.com https://client.example:8443"
+	parts := strings.Split(policy, "; ")
+	if len(parts) != 6 || parts[1] != wantForm {
+		t.Fatalf("unexpected policy: %q", policy)
+	}
+	// Only form-action may differ from the original restrictive policy.
+	baseline := strings.Split(consentPolicy(nil), "; ")
+	for i := range parts {
+		if i != 1 && parts[i] != baseline[i] {
+			t.Fatalf("directive changed: %q", parts[i])
+		}
+	}
+	for _, forbidden := range []string{"evil.example", "unsafe-", "*", "/callback", "connector_platform"} {
+		if strings.Contains(policy, forbidden) {
+			t.Fatalf("unexpected CSP source %q: %s", forbidden, policy)
+		}
+	}
+	// Defense in depth: malformed configuration cannot inject CSP directives.
+	if got := consentPolicy([]string{"https://*.example/callback", "https://bad;host/callback", "http://client.example/callback"}); got != consentPolicy(nil) {
+		t.Fatalf("unsafe source accepted: %q", got)
+	}
+}
+
+func TestConsentPolicyRejectsRequestOrigins(t *testing.T) {
+	s := setup(t)
+	id := register(t, s)
+	q := authQuery(s, id, oauth2.GenerateVerifier())
+	q.Set("redirect_uri", "https://unapproved.example/callback")
+	w := request(s, "GET", "/oauth/authorize", q, nil)
+	if w.Code != http.StatusBadRequest || strings.Contains(w.Header().Get("Content-Security-Policy"), "unapproved.example") {
+		t.Fatal("unapproved request origin entered CSP")
 	}
 }

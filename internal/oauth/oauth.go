@@ -458,7 +458,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		// no-referrer makes native form submissions send Origin: null in Chrome.
 		// Preserve the same-origin Origin required by the strict POST check below.
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Content-Security-Policy", consentPolicy())
+		w.Header().Set("Content-Security-Policy", consentPolicy(s.cfg.Redirects))
 		_ = consent.Execute(w, struct{ Name, Redirect, ID, ClientID string }{c.Name, q.Get("redirect_uri"), id, q.Get("client_id")})
 		return
 	}
