@@ -1,35 +1,37 @@
-# Publishing a GitHub release (tag vX.Y.Z) builds the Docker image for
-# amd64 and arm64 and pushes it to ghcr.io/<owner>/proxmox-mcp, then builds the
-# MCP Bundles for Claude Desktop and uploads them to the release. Stable releases are then
-# published to the MCP Registry.
+# Pushing a version tag (vX.Y.Z) creates a draft GitHub release, builds the
+# Docker image for amd64 and arm64 and pushes it to ghcr.io/<owner>/proxmox-mcp,
+# builds the MCP Bundles for Claude Desktop and plain binaries for each OS and
+# architecture, and attaches them to the draft with a SHA256SUMS file,
+# then publishes the release. Releases are immutable once published, so
+# everything is attached first. Stable releases are then published to the
+# MCP Registry.
 # See docs/releasing.md.
 name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
 
 permissions: {}
 
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
+env:
+  TAG: ${{ github.ref_name }}
+
 jobs:
-  image:
-    name: Build and push image
+  prepare:
+    name: Create the draft release
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
-      contents: write # append image details to the release notes
-      packages: write # push to ghcr.io
-      id-token: write # sign the build provenance attestation
-      attestations: write
+      contents: write # create the draft release
     outputs:
       version: ${{ steps.version.outputs.version }}
       stable: ${{ steps.version.outputs.stable }}
-    env:
-      IMAGE: ghcr.io/${{ github.repository }}
-      TAG: ${{ github.event.release.tag_name }}
+      draft: ${{ steps.release.outputs.draft }}
     steps:
       - name: Validate tag
         id: version
@@ -41,11 +43,65 @@ jobs:
           version="${TAG#v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           # Stable releases get the moving tags (X.Y, X, latest); pre-releases only their exact version.
-          if [[ "$version" == *-* || "${{ github.event.release.prerelease }}" == "true" ]]; then
+          if [[ "$version" == *-* ]]; then
             echo "stable=false" >> "$GITHUB_OUTPUT"
           else
             echo "stable=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tag is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG points to $GITHUB_SHA, which isn't on main. Tag a commit on main."
+            exit 1
+          fi
+
+      - name: Create the draft release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE: ${{ steps.version.outputs.stable }}
+        run: |
+          # A re-run finds the release this workflow already created.
+          draft=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .draft")
+          if [[ -z "$draft" ]]; then
+            prerelease=()
+            [[ "$STABLE" == "true" ]] || prerelease=(--prerelease)
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+              --title "$TAG" --generate-notes "${prerelease[@]}"
+            draft=true
+          fi
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          if [[ "$draft" != "true" ]]; then
+            echo "::notice::$TAG is already published, so its assets can't change. Rebuilding the image only."
+          fi
+
+  image:
+    name: Build and push image
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # append image details to the release notes
+      packages: write # push to ghcr.io
+      id-token: write # sign the build provenance attestation
+      attestations: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Version
+        id: version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          STABLE: ${{ needs.prepare.outputs.stable }}
+        run: |
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "stable=$STABLE" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,7 +110,7 @@ jobs:
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -111,7 +167,11 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          gh release view "$TAG" --json body --jq .body > notes.md
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+          # Re-running the workflow must not add the section twice.
+          if grep -q '^## Container image' notes.md; then
+            exit 0
+          fi
           {
             echo
             echo "## Container image"
@@ -124,7 +184,7 @@ jobs:
             echo
             echo "Tags: $(echo "$TAGS" | sed 's/.*:/`/; s/$/`/' | paste -sd ' ' | sed 's/ /, /g')"
           } >> notes.md
-          gh release edit "$TAG" --notes-file notes.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
 
       - name: Summary
         env:
@@ -138,16 +198,16 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   mcpb:
-    name: Build and upload MCP Bundles
-    # After the image: that job validates the tag, and the tests run inside its build.
-    needs: image
+    name: Build and upload MCP Bundles and binaries
+    # After the image: the tests run inside its build.
+    needs: [prepare, image]
+    # A published release is immutable, so a re-run can't replace its bundles.
+    if: needs.prepare.outputs.draft == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write # upload release assets and append to the release notes
       id-token: write # sign the build provenance attestation
       attestations: write
-    env:
-      TAG: ${{ github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -159,7 +219,13 @@ jobs:
           cache: false
 
       - name: Build
-        run: make mcpb VERSION="${TAG#v}"
+        run: make dist VERSION="${TAG#v}"
+
+      - name: Check the binary
+        run: |
+          tar -xzf "dist/proxmox-mcp-${TAG#v}-linux-amd64.tar.gz" -C "$RUNNER_TEMP" proxmox-mcp
+          test "$("$RUNNER_TEMP/proxmox-mcp" version)" = "${TAG#v}"
+          (cd dist && sha256sum -c SHA256SUMS)
 
       - name: Validate the manifests
         run: |
@@ -174,15 +240,18 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/*.mcpb
+          subject-path: |
+            dist/*.mcpb
+            dist/*.tar.gz
+            dist/*.zip
 
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${TAG#v}"
-          gh release upload "$TAG" dist/*.mcpb --clobber
-          gh release view "$TAG" --json body --jq .body > notes.md
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/*.mcpb dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
           # Re-running the workflow must not add the section twice.
           if grep -q '^## Claude Desktop' notes.md; then
             exit 0
@@ -200,23 +269,51 @@ jobs:
             echo "| Windows on x64 | \`proxmox-mcp-$version-windows-amd64.mcpb\` |"
             echo "| Windows on Arm | \`proxmox-mcp-$version-windows-arm64.mcpb\` |"
             echo "| Linux | \`proxmox-mcp-$version-linux-amd64.mcpb\`, \`proxmox-mcp-$version-linux-arm64.mcpb\` |"
+            echo
+            echo "## Binaries"
+            echo
+            echo "To run proxmox-mcp without Docker, download the archive for your platform. Each one holds the \`proxmox-mcp\` binary and the licence. See [Running without Docker](https://proxmox-mcp.mattoddie.dev/docs/deployment/#running-without-docker)."
+            echo
+            echo "| Platform | Archive |"
+            echo "|---|---|"
+            echo "| macOS | \`proxmox-mcp-$version-darwin-arm64.tar.gz\`, \`proxmox-mcp-$version-darwin-amd64.tar.gz\` |"
+            echo "| Linux | \`proxmox-mcp-$version-linux-amd64.tar.gz\`, \`proxmox-mcp-$version-linux-arm64.tar.gz\` |"
+            echo "| Windows | \`proxmox-mcp-$version-windows-amd64.zip\`, \`proxmox-mcp-$version-windows-arm64.zip\` |"
+            echo
+            echo "Check a download with \`sha256sum -c SHA256SUMS --ignore-missing\` or \`gh release verify-asset $TAG <file> -R $GITHUB_REPOSITORY\`."
           } >> notes.md
-          gh release edit "$TAG" --notes-file notes.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+
+  publish:
+    name: Publish the release
+    needs: [prepare, image, mcpb]
+    if: needs.prepare.outputs.draft == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # publish the draft release
+    steps:
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
 
   registry:
     name: Publish to the MCP Registry
-    # After the image and the bundles: the registry checks the image's label, and server.json
+    # After the release is published: the registry checks the image's label, and server.json
     # carries the bundles' checksums. Pre-releases aren't listed.
-    needs: [image, mcpb]
-    if: needs.image.outputs.stable == 'true'
+    needs: [prepare, image, publish]
+    # On a re-run of an already published release, publish is skipped and this still runs.
+    if: >-
+      ${{ !cancelled() && needs.prepare.outputs.stable == 'true' && needs.image.result == 'success' &&
+      (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.prepare.outputs.draft != 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read # download the bundles from the release
       id-token: write # log in to the registry with GitHub OIDC
     env:
-      TAG: ${{ github.event.release.tag_name }}
-      VERSION: ${{ needs.image.outputs.version }}
+      VERSION: ${{ needs.prepare.outputs.version }}
       # Pinned like everything else. To update, take the checksum of
       # mcp-publisher_linux_amd64.tar.gz from the release's registry_<version>_checksums.txt.
       MCP_PUBLISHER_VERSION: 1.8.1

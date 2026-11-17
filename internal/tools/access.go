@@ -385,7 +385,7 @@ func registerAccess(c *Context) {
 		Title:       "Create or update a user",
 		Description: "Create (create=true) or update a Proxmox user. Only the given fields change on update. `password` is only accepted on create and only for the pve realm (pam users need a Linux account on every node); change existing passwords with proxmox_change_password. Groups replace the user's groups unless append=true. Grant permissions afterwards with proxmox_update_acl.",
 		Write:       true,
-		Destructive: False,
+		Destructive: True,
 		Input: []Prop{
 			P("userid", accessUseridArg),
 			P("create", Bool().Opt().D("Create a new user (default false = update an existing one)")),
@@ -646,15 +646,21 @@ func registerAccess(c *Context) {
 
 	c.Define("proxmox_list_privileges", Def{
 		Toolset:     accessToolset,
+		List:        &listing{},
 		Title:       "List privileges",
-		Description: "List every privilege Proxmox knows (derived from the built-in Administrator role, which holds them all), grouped by area. Use when building a custom role with proxmox_save_role.",
+		Description: "List every privilege Proxmox knows (derived from the built-in Administrator role, which holds them all), sorted, each with its area (VM, Datastore, Sys...). Use when building a custom role with proxmox_save_role.",
 		Handler: func(ctx context.Context, a *Obj) (any, error) {
 			r, err := client.Get(ctx, "/access/roles/Administrator", nil)
 			if err != nil {
 				return nil, err
 			}
 			privs := accessRolePrivs(r)
-			return js.O("count", len(privs), "by_area", accessGroupPrivs(privs)), nil
+			sort.Strings(privs)
+			items := make([]any, len(privs))
+			for i, p := range privs {
+				items[i] = js.O("privilege", p, "area", strings.Split(p, ".")[0])
+			}
+			return items, nil
 		},
 	})
 
@@ -1083,7 +1089,7 @@ func registerAccess(c *Context) {
 		Toolset:      accessToolset,
 		Title:        "Sync users/groups from a realm",
 		NativeDryRun: true,
-		Description:  "Sync users and/or groups from an LDAP, AD or OpenID realm into Proxmox. Use dry_run=true first to see what would change (in the task log). Options not given fall back to the realm's sync-defaults-options. Synced groups are named <group>-<realm>.",
+		Description:  "Sync users and/or groups from an LDAP, AD or OpenID realm into Proxmox. Use dry_run=true first to see what would change (in the task log). Options not given fall back to the realm's sync-defaults-options. Synced groups are named <group>-<realm>. remove_vanished with entry or acl (given or from the realm's defaults) deletes users, groups or ACLs and needs delete access (PROXMOX_ALLOW_DELETES) unless dry_run=true.",
 		Write:        true,
 		Destructive:  True,
 		Input: []Prop{
@@ -1095,6 +1101,21 @@ func registerAccess(c *Context) {
 			P("wait", waitArg),
 		},
 		Handler: func(ctx context.Context, a *Obj) (any, error) {
+			if !c.AllowDeletes && a.Get("dry_run") != true {
+				removes := removesVanished(a.Get("remove_vanished"))
+				if !a.Defined("remove_vanished") {
+					// Proxmox falls back to the realm's sync defaults, so check those.
+					cfg, err := client.GetObj(ctx, "/access/domains/"+enc(a.Get("realm")), nil)
+					if err != nil {
+						return nil, err
+					}
+					defaults := proxmox.ParsePropertyString(js.Str(or(cfg.Get("sync-defaults-options"), "")), "")
+					removes = removesVanished(defaults.Get("remove-vanished")) || paramTruthy(defaults.Get("purge"))
+				}
+				if removes {
+					return nil, errors.New("Removing vanished users, groups or ACLs (remove_vanished with entry or acl, here or in the realm's sync defaults) deletes them and needs delete access (PROXMOX_ALLOW_DELETES=true); pass remove_vanished='none' or 'properties', or dry_run=true")
+				}
+			}
 			upid, err := client.Post(ctx, "/access/domains/"+enc(a.Get("realm"))+"/sync",
 				defined(js.O("dry-run", a.Get("dry_run"), "scope", a.Get("scope"), "enable-new", a.Get("enable_new"), "remove-vanished", a.Get("remove_vanished"))))
 			if err != nil {
@@ -1205,7 +1226,7 @@ func registerAccess(c *Context) {
 	c.Define("proxmox_save_realm_sync_job", Def{
 		Toolset:     accessToolset,
 		Title:       "Create or update a realm sync job",
-		Description: "Create (create=true, with realm and schedule) or update a scheduled realm sync job. Check schedules with proxmox_simulate_schedule. For a one-off sync use proxmox_sync_realm.",
+		Description: "Create (create=true, with realm and schedule) or update a scheduled realm sync job. Check schedules with proxmox_simulate_schedule. For a one-off sync use proxmox_sync_realm. remove_vanished with entry or acl needs delete access (PROXMOX_ALLOW_DELETES).",
 		Write:       true,
 		Destructive: False,
 		Input: []Prop{
@@ -1221,6 +1242,9 @@ func registerAccess(c *Context) {
 			P("delete", deleteKeysArg),
 		},
 		Handler: func(ctx context.Context, a *Obj) (any, error) {
+			if !c.AllowDeletes && removesVanished(a.Get("remove_vanished")) {
+				return nil, errors.New("remove_vanished with entry or acl makes every run delete users, groups or ACLs and needs delete access (PROXMOX_ALLOW_DELETES=true)")
+			}
 			params := defined(js.O(
 				"enabled", a.Get("enabled"),
 				"scope", a.Get("scope"),

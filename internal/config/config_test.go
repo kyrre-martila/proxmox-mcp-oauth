@@ -138,11 +138,11 @@ func TestConfig(t *testing.T) {
 		wantErr(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_DELETES", "true"), `also requires PROXMOX_ALLOW_WRITES`)
 		wantErr(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_EXEC", "true"), `also requires PROXMOX_ALLOW_WRITES`)
 		cfg := load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_WRITES", "1", "PROXMOX_ALLOW_DELETES", "yes", "PROXMOX_ALLOW_EXEC", "on", "PROXMOX_TOOLSETS", "cluster, VMS"))
-		if !cfg.Tools.AllowDeletes || !cfg.Tools.AllowExec || cfg.Tools.AllowUnredacted {
+		if !cfg.Tools.AllowDeletes || !cfg.Tools.AllowExec || cfg.Tools.AllowSecrets {
 			t.Fatalf("%+v", cfg.Tools)
 		}
-		if !load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_UNREDACTED", "true")).Tools.AllowUnredacted {
-			t.Fatal("PROXMOX_ALLOW_UNREDACTED")
+		if !load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_SECRETS", "true")).Tools.AllowSecrets {
+			t.Fatal("PROXMOX_ALLOW_SECRETS")
 		}
 		var names []string
 		for ts := range cfg.Tools.Toolsets {
@@ -153,10 +153,11 @@ func TestConfig(t *testing.T) {
 			t.Fatal(names)
 		}
 		wantErr(t, env("PROXMOX_URL", "https://pve", "PROXMOX_TOOLSETS", "cluster,bogus"), `Unknown toolset "bogus"`)
-		// Anything but 1/true/yes/on is false, as before.
-		if load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_WRITES", "maybe")).Tools.AllowWrites {
-			t.Fatal("maybe is false")
+		deny := load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_DENY_TOOLS", " proxmox_delete_vm, PROXMOX_CONTROL_VM_POWER,,")).Tools.DenyTools
+		if !reflect.DeepEqual(deny, map[string]bool{"proxmox_delete_vm": true, "proxmox_control_vm_power": true}) {
+			t.Fatal(deny)
 		}
+		wantErr(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_WRITES", "maybe"), `PROXMOX_ALLOW_WRITES must be true or false`)
 	})
 
 	t.Run("makes the operator choose how to check an https certificate", func(t *testing.T) {
@@ -173,6 +174,8 @@ func TestConfig(t *testing.T) {
 		}
 		wantErr(t, e(), `^PROXMOX_URL uses https, but no way to check the Proxmox certificate is configured\..*PROXMOX_TLS_FINGERPRINT=.*PROXMOX_CA_FILE=.*PROXMOX_VERIFY_SSL=true.*PROXMOX_VERIFY_SSL=false`)
 		wantErr(t, e("PROXMOX_VERIFY_SSL", " "), `no way to check the Proxmox certificate`)
+		// A typo is an error, not a silent "false" that would also skip the choice above.
+		wantErr(t, e("PROXMOX_VERIFY_SSL", "ture"), `^PROXMOX_VERIFY_SSL must be true or false`)
 		if load(t, e("PROXMOX_VERIFY_SSL", "false")).Proxmox.VerifySSL {
 			t.Fatal("explicitly off")
 		}
@@ -229,13 +232,34 @@ func TestConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("parses numbers like parseInt", func(t *testing.T) {
-		cfg := load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_TIMEOUT_MS", "5000ms", "PROXMOX_TASK_TIMEOUT_MS", "60000", "MCP_HTTP_PORT", "9000"))
+	t.Run("parses numbers strictly", func(t *testing.T) {
+		cfg := load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_TIMEOUT_MS", "5000", "PROXMOX_TASK_TIMEOUT_MS", " 60000 ", "MCP_HTTP_PORT", "9000"))
 		if cfg.Proxmox.TimeoutMs != 5000 || cfg.Proxmox.TaskTimeoutMs != 60000 || cfg.HTTP.Port != 9000 {
 			t.Fatalf("%+v", cfg)
 		}
 		wantErr(t, env("PROXMOX_URL", "https://pve", "PROXMOX_TASK_TIMEOUT_MS", "0"), `PROXMOX_TASK_TIMEOUT_MS must be a positive integer, got "0"`)
 		wantErr(t, env("PROXMOX_URL", "https://pve", "MCP_HTTP_PORT", "http"), `MCP_HTTP_PORT must be a positive integer`)
+		for _, bad := range []string{"30s", "5000ms", "1e3", "1.5", "-5", "+5", "0x10", "99999999999"} {
+			wantErr(t, env("PROXMOX_URL", "https://pve", "PROXMOX_TIMEOUT_MS", bad), `^PROXMOX_TIMEOUT_MS must be a positive integer, got "`+regexp.QuoteMeta(bad)+`"$`)
+		}
+	})
+
+	t.Run("parses booleans strictly", func(t *testing.T) {
+		for _, v := range []string{"true", "TRUE", "1", "yes", "Yes", "on", "ON"} {
+			if !load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_WRITES", v)).Tools.AllowWrites {
+				t.Fatalf("%q should be true", v)
+			}
+		}
+		for _, v := range []string{"false", "FALSE", "0", "no", "off", "Off"} {
+			if load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_ALLOW_WRITES", v)).Tools.AllowWrites {
+				t.Fatalf("%q should be false", v)
+			}
+		}
+		for _, name := range []string{"PROXMOX_ALLOW_WRITES", "PROXMOX_ALLOW_DELETES", "PROXMOX_ALLOW_EXEC", "PROXMOX_ALLOW_SECRETS", "MCP_ALLOW_UNAUTHENTICATED", "PROXMOX_VERIFY_SSL"} {
+			for _, bad := range []string{"ture", "enabled", "2", "y"} {
+				wantErr(t, env("PROXMOX_URL", "https://pve", name, bad), `^`+name+` must be true or false \(or 1/0, yes/no, on/off\), got "`+bad+`"$`)
+			}
+		}
 	})
 
 	t.Run("reads secrets from _FILE variables", func(t *testing.T) {
@@ -249,7 +273,7 @@ func TestConfig(t *testing.T) {
 			t.Fatalf("%+v %+v", cfg.Proxmox, cfg.HTTP)
 		}
 		wantErr(t, plain("PROXMOX_URL_FILE", filepath.Join(dir, "missing")), `^Could not read PROXMOX_URL_FILE \(.*missing\): no such file or directory$`)
-		cfg = load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_DEFAULT_NODE", "pve2", "PROXMOX_VERIFY_SSL", "TRUE"))
+		cfg = load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_NODE", "pve2", "PROXMOX_VERIFY_SSL", "TRUE"))
 		if cfg.Proxmox.DefaultNode != "pve2" || !cfg.Proxmox.VerifySSL {
 			t.Fatalf("%+v", cfg.Proxmox)
 		}
@@ -274,11 +298,12 @@ func TestBundleUnsetValues(t *testing.T) {
 			"PROXMOX_TLS_FINGERPRINT": fp,
 			"PROXMOX_VERIFY_SSL":      unset("verify_ssl"),
 			"PROXMOX_CA_FILE":         unset("ca_file"),
-			"PROXMOX_DEFAULT_NODE":    unset("default_node"),
+			"PROXMOX_NODE":            unset("node"),
 			"PROXMOX_ALLOW_WRITES":    "false",
 			"PROXMOX_ALLOW_DELETES":   "false",
 			"PROXMOX_ALLOW_EXEC":      "false",
 			"PROXMOX_TOOLSETS":        unset("toolsets"),
+			"PROXMOX_DENY_TOOLS":      unset("deny_tools"),
 			"PROXMOX_AUDIT_LOG":       unset("audit_log"),
 		}
 		cfg := load(t, MapEnv(vars))
@@ -286,7 +311,7 @@ func TestBundleUnsetValues(t *testing.T) {
 		if p.TokenID != "root@pam!mcp" || p.Username != "" || p.Password != "" || p.CACert != "" || p.DefaultNode != "" || len(p.TLSFingerprints) != 1 {
 			t.Errorf("%q: proxmox: %+v", vars["PROXMOX_USERNAME"], p)
 		}
-		if tl := cfg.Tools; tl.AllowWrites || tl.AuditLog != "" || len(tl.Toolsets) != len(Toolsets)-1 {
+		if tl := cfg.Tools; tl.AllowWrites || tl.AuditLog != "" || len(tl.Toolsets) != len(Toolsets)-1 || len(tl.DenyTools) != 0 {
 			t.Errorf("%q: tools: %+v", vars["PROXMOX_USERNAME"], tl)
 		}
 		// With nothing to check the certificate, an https URL is still refused.
@@ -301,7 +326,7 @@ func TestBundleUnsetValues(t *testing.T) {
 		}
 	}
 	// Only a whole placeholder is treated as unset.
-	if cfg := load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_DEFAULT_NODE", "x${user_config.default_node}")); cfg.Proxmox.DefaultNode != "x${user_config.default_node}" {
+	if cfg := load(t, env("PROXMOX_URL", "https://pve", "PROXMOX_NODE", "x${user_config.node}")); cfg.Proxmox.DefaultNode != "x${user_config.node}" {
 		t.Errorf("partial placeholder: %q", cfg.Proxmox.DefaultNode)
 	}
 }

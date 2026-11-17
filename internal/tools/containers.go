@@ -615,7 +615,7 @@ func registerContainers(c *Context) {
 
 	// ---------------------------------------------------------------- write
 
-	c.Define("proxmox_container_power", Def{
+	c.Define("proxmox_control_container_power", Def{
 		Toolset:     "containers",
 		Title:       "Start, stop or reboot a container",
 		Description: "Change an LXC container's power state: start, stop (immediate, like pulling the plug), shutdown (clean, with optional timeout and force_stop), reboot (clean shutdown and start; applies pending changes), suspend or resume (experimental for containers). Returns once the task finishes unless wait=false.",
@@ -963,7 +963,7 @@ func registerContainers(c *Context) {
 	c.Define("proxmox_move_container_volume", Def{
 		Toolset:     "containers",
 		Title:       "Move a container volume",
-		Description: "Move a container's rootfs or mount point to another storage (storage), or reassign a volume to another container (target_vmid, optional target_volume). The container usually must be stopped to move rootfs. By default the original is kept as an unusedN entry; delete_source=true removes it after a successful copy.",
+		Description: "Move a container's rootfs or mount point to another storage (storage), or reassign a volume to another container (target_vmid, optional target_volume). The container usually must be stopped to move rootfs. By default the original is kept as an unusedN entry; delete_source=true removes it after a successful copy and needs delete access (PROXMOX_ALLOW_DELETES).",
 		Write:       true,
 		Destructive: True,
 		Input: []Prop{
@@ -982,6 +982,9 @@ func registerContainers(c *Context) {
 		Handler: func(ctx context.Context, a *Obj) (any, error) {
 			if !a.Truthy("storage") && js.IsUndef(a.Get("target_vmid")) {
 				return nil, errors.New("Give storage (move to storage) or target_vmid (reassign to container)")
+			}
+			if a.Truthy("delete_source") && !c.AllowDeletes {
+				return nil, errors.New("delete_source permanently deletes the original volume and needs delete access (PROXMOX_ALLOW_DELETES=true); without it the original is kept as an unusedN entry")
 			}
 			g, err := ct(ctx, a)
 			if err != nil {
@@ -1057,7 +1060,7 @@ func registerContainers(c *Context) {
 				return nil, fmt.Errorf("Container %s is already a template", js.NumStr(g.VMID))
 			}
 			if g.Status == "running" {
-				return nil, fmt.Errorf("Container %s is running; shut it down first (proxmox_container_power)", js.NumStr(g.VMID))
+				return nil, fmt.Errorf("Container %s is running; shut it down first (proxmox_control_container_power)", js.NumStr(g.VMID))
 			}
 			res, err := client.Post(ctx, client.GuestPath(g)+"/template", nil)
 			if err != nil {

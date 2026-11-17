@@ -78,11 +78,12 @@ To update, install the bundle from a newer release the same way.
 | **TLS certificate fingerprint** | `PROXMOX_TLS_FINGERPRINT` | **Recommended.** The SHA-256 fingerprint of the node's certificate, shown under **Node → System → Certificates**, so nobody on the network can impersonate it. |
 | **Verify certificate (true/false)** | `PROXMOX_VERIFY_SSL` | Leave empty when you set a fingerprint or CA file. `true` for a publicly trusted certificate, `false` to skip the check (not recommended). |
 | **CA certificate file** | `PROXMOX_CA_FILE` | A PEM file with the CA that signed the node's certificate (the cluster's is `/etc/pve/pve-root-ca.pem` on any node), instead of a fingerprint. |
-| **Default node** | `PROXMOX_DEFAULT_NODE` | The node used when a request doesn't name one. Not needed on a single-node install. |
+| **Default node** | `PROXMOX_NODE` | The node used when a request doesn't name one. Not needed on a single-node install. |
 | **Allow changes** | `PROXMOX_ALLOW_WRITES` | Off by default, which keeps the assistant read-only. Read [Security](security.md) before turning it on. |
 | **Allow deletes** | `PROXMOX_ALLOW_DELETES` | Also allows deleting guests, volumes, snapshots, backups and configuration. Needs **Allow changes**. |
 | **Allow exec** | `PROXMOX_ALLOW_EXEC` | Also allows running commands and reading and writing files inside VMs through the guest agent. Needs **Allow changes**. |
 | **Toolsets** | `PROXMOX_TOOLSETS` | Optional, such as `cluster,nodes,vms,containers,backup,tasks`. Empty means all except `raw`, which is 131 KB of the model's context read-only and up to 397 KB with everything allowed. See [Keeping the tool list small](configuration.md#keeping-the-tool-list-small). |
+| **Denied tools** | `PROXMOX_DENY_TOOLS` | Optional comma-separated tool names never to offer, such as `proxmox_delete_vm,proxmox_control_vm_power`. An unknown name stops the server, which then shows in the extension's log. |
 | **Audit log file** | `PROXMOX_AUDIT_LOG` | Optional full path to a file, such as `/Users/you/proxmox-mcp-audit.jsonl`, that records every change Claude makes or previews. The folder must exist; the file is created. `stderr` writes the entries to the extension's log instead. Off when empty. See [Audit log](configuration.md#audit-log). |
 
 Fill in either the API token or the username and password. Settings you leave empty use their defaults, as described in [Configuration](configuration.md).
@@ -217,3 +218,34 @@ Tips:
 - **Always pass `-i` and never `-t`.** A TTY corrupts the MCP message stream.
 - **Docker on another machine** works too. Set `DOCKER_HOST` in the client's `env`, and note that `PROXMOX_URL` must be reachable from that machine.
 - **Pin a version** (for example `:1.2.3`) so a new `latest` doesn't surprise you. See [Deployment](deployment.md#image-tags).
+
+### Without Docker
+
+With a [release binary](deployment.md#download-a-release-binary), the client runs it directly. Use the binary's full path as the command, and pass the settings as environment variables. In a JSON client config, that looks like:
+
+```json
+{
+  "mcpServers": {
+    "proxmox": {
+      "command": "/usr/local/bin/proxmox-mcp",
+      "env": {
+        "PROXMOX_URL": "https://192.168.1.10:8006",
+        "PROXMOX_TOKEN_ID": "mcp@pve!mcp",
+        "PROXMOX_TOKEN_SECRET": "your-token-secret",
+        "PROXMOX_TLS_FINGERPRINT": "AB:CD:..."
+      }
+    }
+  }
+}
+```
+
+The binary uses stdio by default, so there's no `MCP_TRANSPORT` to set. In Claude Code:
+
+```sh
+claude mcp add proxmox \
+  --env PROXMOX_URL=https://192.168.1.10:8006 \
+  --env 'PROXMOX_TOKEN_ID=mcp@pve!mcp' \
+  --env PROXMOX_TOKEN_SECRET=your-token-secret \
+  --env PROXMOX_TLS_FINGERPRINT=AB:CD:... \
+  -- /usr/local/bin/proxmox-mcp
+```

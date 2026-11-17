@@ -67,7 +67,7 @@ The server was first written in TypeScript. The tools reshape loosely typed API 
 
 ## How a request flows
 
-1. An MCP client calls a tool, for example `proxmox_vm_power {vmid: 101, action: "start"}`.
+1. An MCP client calls a tool, for example `proxmox_control_vm_power {vmid: 101, action: "start"}`.
 2. The handler that `Define()` registers validates the arguments against the tool's schema (types, ranges, enums, patterns, required arguments) and drops unknown ones.
 3. The tool's handler runs. For guest tools it first calls `client.ResolveGuest()`, which finds the guest's node and type in `/cluster/resources`. For node tools it calls `client.ResolveNode()`.
 4. `Client.Request()` authenticates (a `PVEAPIToken` header, or a ticket cookie plus CSRF token that's renewed before it expires and on `401`), sends parameters the way the web UI does (query string for `GET`/`DELETE`, form body for `POST`/`PUT`), never follows redirects, and unwraps the `{data}` envelope. Failures become a `*proxmox.Error` with Proxmox's reason, any per-parameter errors and a hint.
@@ -122,12 +122,15 @@ The `Def` fields that control registration:
 | `Idempotent: true` | Repeating the call with the same arguments has no further effect. Sets `idempotentHint`. |
 | `ReadOnly` | Overrides the read-only hint. Used, for example, by exec tools that only read. |
 | `List` | Makes it a list tool: see below. |
-| `Reads` | For a tool that changes things only for some arguments (the raw API tool), says which calls are reads, so they aren't audited. |
+| `Reads` | For a tool that changes things only for some arguments (the raw API tool, remote storage scans), says which calls are reads, so they aren't audited. |
+| `Secrets` | Argument names whose values are always redacted in the audit log and dry-run previews. |
 | `NativeDryRun` | The tool has its own `dry_run` that Proxmox runs (realm sync), so the server doesn't add one. |
 
 `Delete` and `Exec` imply `Write`, so a tool with `Delete: true` is never registered without writes.
 
-Every tool that changes something gets a `dry_run` argument automatically, and its calls go to the audit log. In a dry run `Client.Request()` sends reads but stops the first request that would change something, and the tool returns a preview of it instead. A `POST` that only reads (such as the guest agent's ping) must use `proxmox.AsRead(ctx)` so a dry run still sends it.
+Every tool that changes something gets a `dry_run` argument automatically, and its calls go to the audit log. In a dry run `Client.Request()` sends reads but stops the first request that would change something, and the tool returns a preview of it instead. A `POST` that only reads (such as the guest agent's ping) must use `proxmox.AsRead(ctx)` so a dry run still sends it. The opposite, `proxmox.AsChange(ctx)`, is for a `GET` that makes the node connect to a server of the caller's choosing (a remote storage scan): a dry run stops it and the audit log records it.
+
+Arguments that hold a secret under a name the redaction can't recognise, such as a certificate's `key` or an ACME plugin's `data`, go in `Def.Secrets`, which redacts them in the audit log and dry-run previews.
 
 List tools set `List: &listing{}`. The handler returns its items as an array, or as an object holding the array under `listing.Items` (such as `{node, pools: [...]}`), and the listing adds `search`, `fields` and, with `Limit` set, `limit`, then shapes the result as `{total, returned, items}`. Tools that already filter with `filterAndLimit()` keep their own `search` and `limit` and only gain `fields`.
 
@@ -157,7 +160,7 @@ Checklist for a new tool:
 
 ## Tool design guidelines
 
-- **Fewer, broader tools beat many narrow ones.** One `proxmox_vm_power` with an `action` is easier for a model than separate start, stop, shutdown and reboot tools.
+- **Fewer, broader tools beat many narrow ones.** One `proxmox_control_vm_power` with an `action` is easier for a model than separate start, stop, shutdown and reboot tools.
 - **Never surprise.** Updates only change what was asked. Destructive actions are flagged. Deletes and exec are behind their own switches.
 - **Errors should teach.** Return messages that tell the model, or the user, how to fix the call: *"target is required for migrate"*. `proxmox.Error` already adds hints for `401`, `403` and `501`.
 - **Respect Proxmox's own permissions.** Don't work around a `403`; report it. The token's ACLs are a security layer the user chose.
@@ -184,7 +187,7 @@ func TestVmPower(t *testing.T) {
 		// VM 101 is a stopped VM on pve2 in the fixtures; the tool finds its node itself.
 		upid := env.mock.Upid("pve2", "qmstart", "101")
 		env.mock.Reply("POST", `^/nodes/pve2/qemu/101/status/start$`, upid)
-		res := env.call(t, "proxmox_vm_power", `{"vmid":101,"action":"start"}`)
+		res := env.call(t, "proxmox_control_vm_power", `{"vmid":101,"action":"start"}`)
 		eqAt(t, res, "status", "ok")
 		eqStr(t, env.mock.LastWrite().Path, "/nodes/pve2/qemu/101/status/start")
 	})
@@ -192,7 +195,7 @@ func TestVmPower(t *testing.T) {
 	t.Run("reports a failed task with its log", func(t *testing.T) {
 		upid := env.mock.Upid("pve2", "qmstart", "101", proxmoxtest.Task{Status: "stopped", ExitStatus: "start failed", Log: []string{"kvm: out of memory"}})
 		env.mock.Reply("POST", `/qemu/101/status/start$`, upid)
-		match(t, env.errorText(t, "proxmox_vm_power", `{"vmid":101,"action":"start"}`), `out of memory`)
+		match(t, env.errorText(t, "proxmox_control_vm_power", `{"vmid":101,"action":"start"}`), `out of memory`)
 	})
 }
 ```

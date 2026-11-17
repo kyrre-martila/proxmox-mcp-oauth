@@ -23,7 +23,7 @@ The server checks the configuration at startup. If something is wrong, it exits 
 | `PROXMOX_CA_FILE` | | Path to a PEM file with the CA certificate(s) to trust (in addition to the system CAs). Setting it turns certificate verification on, whatever `PROXMOX_VERIFY_SSL` says. Use the cluster's own CA, `/etc/pve/pve-root-ca.pem` on any node, to verify the default node certificates. |
 | `PROXMOX_TIMEOUT_MS` | `30000` | Timeout for each API request, in milliseconds. |
 | `PROXMOX_TASK_TIMEOUT_MS` | `120000` | How long tools wait for a Proxmox task (start, clone, migrate, backup…) to finish before returning. A task that takes longer keeps running and the tool returns its task ID. See [Usage](usage.md#tasks-and-wait). |
-| `PROXMOX_DEFAULT_NODE` | | Node used by node-scoped tools when a call doesn't name one. Single-node installs don't need it. In a cluster without it, those tools ask for a node. |
+| `PROXMOX_NODE` | | Node used by node-scoped tools when a call doesn't name one. Single-node installs don't need it. In a cluster without it, those tools ask for a node. |
 
 A variable set to an empty value counts as unset and gets its default. So does one set to exactly `${user_config.<key>}`, which is how Claude Desktop passes an [extension setting](clients.md#claude-desktop) that was left empty.
 
@@ -42,7 +42,7 @@ Without verification, a machine that can intercept the traffic between proxmox-m
 - **Use a trusted certificate** (for example from Proxmox's built-in ACME support) and set `PROXMOX_VERIFY_SSL=true`.
 - **Skip verification** with `PROXMOX_VERIFY_SSL=false`. Only on a network you trust: the server logs a warning at startup.
 
-Boolean variables accept `true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off`. Anything else counts as `false`.
+Boolean variables accept `true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off` (any case). Anything else stops the server at startup, so a typo such as `PROXMOX_VERIFY_SSL=ture` can't quietly turn a setting off. Number variables must be plain positive whole numbers: `30s` is an error.
 
 ## Authentication
 
@@ -69,8 +69,9 @@ How each method works:
 | `PROXMOX_ALLOW_WRITES` | `false` | Register tools that change state: starting and stopping guests, creating, cloning, migrating and reconfiguring them, snapshots, backups, firewall, storage and more. Also needed for anything that makes a node connect to a server you name: remote storage scans, `proxmox_query_url_metadata` and ACME directory lookups. |
 | `PROXMOX_ALLOW_DELETES` | `false` | Also register tools that delete guests, snapshots, backups, volumes and configuration. Requires `PROXMOX_ALLOW_WRITES=true`. |
 | `PROXMOX_ALLOW_EXEC` | `false` | Also register tools that run commands or read and write files inside VMs through the QEMU guest agent, and send QEMU monitor commands. Also allows the equivalent endpoints in the raw API tool (every guest agent endpoint, consoles and shells, `sendkey`, the monitor and migration tunnels). Requires `PROXMOX_ALLOW_WRITES=true`. |
-| `PROXMOX_ALLOW_UNREDACTED` | `false` | Offer the raw API tool's `redact: false` argument, which returns responses without secret redaction. Off, every response is redacted whatever the model asks for. |
+| `PROXMOX_ALLOW_SECRETS` | `false` | Offer the raw API tool's `include_secrets: true` argument, which returns responses without secret redaction. Off, every response is redacted whatever the model asks for. |
 | `PROXMOX_TOOLSETS` | `all` | Comma-separated list of [toolsets](#toolsets) to expose. See [Keeping the tool list small](#keeping-the-tool-list-small). `all` means every toolset except `raw`, which is only enabled when listed by name (e.g. `all,raw`). |
+| `PROXMOX_DENY_TOOLS` | | Comma-separated tool names never to register, whatever the toolsets and access level allow, e.g. `proxmox_delete_vm,proxmox_control_vm_power,proxmox_migrate_vm`. Use it to keep one or two tools out of a toolset you otherwise want. An unknown name stops the server at startup, so a typo can't leave a tool on. The raw API tool (`raw` toolset) can still reach the same endpoints, so don't enable it alongside a deny list you rely on. |
 
 That gives four access levels. The [tool reference](tools.md) labels every tool with the level it needs:
 
@@ -93,7 +94,7 @@ Every tool that changes something also takes `dry_run`. With `dry_run: true` the
 |---|---|---|
 | `PROXMOX_AUDIT_LOG` | (off) | Record every call of a tool that changes things. A file path appends JSON Lines to that file, which is created with mode `0600` if it doesn't exist; its directory must exist, or the server won't start. `stderr` writes the lines to standard error, next to the server's other logs. |
 
-Each line is one call of a write, delete or exec tool, or of `proxmox_api_request` with a method other than `GET`. Read-only tools aren't logged. Dry runs, calls that failed and calls refused for invalid arguments are all logged:
+Each line is one call of a write, delete or exec tool, of `proxmox_api_request` with a method other than `GET`, or of a request that makes a node connect to a server you name (remote storage scans, URL metadata and ACME directory lookups, through their tools or the raw API tool). Read-only tools aren't logged. Dry runs, calls that failed and calls refused for invalid arguments are all logged:
 
 ```json
 {"time":"2026-10-22T09:14:03.120Z","tool":"proxmox_update_vm_config","dry_run":false,"arguments":{"vmid":100,"memory_mb":8192,"extra":{"cipassword":"<redacted>"}},"requests":[{"method":"POST","path":"/nodes/pve1/qemu/100/config","status":200}],"outcome":"ok"}
@@ -157,7 +158,7 @@ If both `NAME` and `NAME_FILE` are set, the file wins. `PROXMOX_CA_FILE` is alre
 
 ## Keeping the tool list small
 
-Most MCP clients send every tool's name, description and argument schema to the model with each request. With every toolset enabled that's about 131 KB for the 154 read-only tools, 344 KB for 261 tools with writes on, and 397 KB for all 313 tools with deletes and exec on too. That uses up context you'd rather spend on your conversation and your cluster's data, and some clients warn about or cap the number of tools.
+Most MCP clients send every tool's name, description and argument schema to the model with each request. With every toolset enabled that's about 134 KB for the 156 read-only tools, 355 KB for 266 tools with writes on, and 408 KB for all 318 tools with deletes and exec on too. That uses up context you'd rather spend on your conversation and your cluster's data, and some clients warn about or cap the number of tools.
 
 `PROXMOX_TOOLSETS` is the way to keep the list small. Enable only the toolsets you need: the model sees fewer tools, picks the right one more easily, and can't reach the rest at all.
 
@@ -167,13 +168,13 @@ Clients with their own tool search, such as Claude Code, load tool definitions o
 
 | Toolset | Tools | Use it for |
 |---|---:|---|
-| `cluster` | 15 | Cluster overview, nodes and guests at a glance. **Always include it.** |
+| `cluster` | 18 | Cluster overview, nodes and guests at a glance. **Always include it.** |
 | `nodes` | 49 | Node status, services, network, updates, certificates, logs |
-| `vms` | 20 | QEMU virtual machines |
+| `vms` | 21 | QEMU virtual machines |
 | `containers` | 16 | LXC containers |
 | `agent` | 13 | Information from inside VMs via the guest agent, and (with exec) commands |
 | `snapshots` | 7 | Guest snapshots |
-| `storage` | 25 | Storage, volumes, ISOs and templates, physical disks, ZFS, LVM |
+| `storage` | 26 | Storage, volumes, ISOs and templates, physical disks, ZFS, LVM |
 | `backup` | 16 | Backup jobs, backups, restores |
 | `tasks` | 5 | Task history and logs. **Include it whenever you allow writes**, so the assistant can follow tasks. |
 | `access` | 33 | Users, groups, roles, ACLs, tokens, realms, 2FA |
@@ -195,15 +196,15 @@ The sizes are the `tools/list` result the client receives, measured by starting 
 
 | Goal | `PROXMOX_TOOLSETS` | Read-only | With writes | With deletes |
 |---|---|---:|---:|---:|
-| Everyday monitoring | `cluster,nodes,vms,containers,storage,backup,tasks` | 76 tools, 67 KB | 127 tools, 178 KB | 144 tools, 196 KB |
-| Running guests day to day | `cluster,vms,containers,agent,snapshots,backup,tasks` | 45 tools, 42 KB | 77 tools, 119 KB | 85 tools, 129 KB |
-| Backup and snapshot hygiene | `cluster,snapshots,backup,storage,tasks` | 40 tools, 36 KB | 58 tools, 74 KB | 68 tools, 86 KB |
-| Security review | `cluster,nodes,access,firewall,tasks` | 65 tools, 52 KB | 105 tools, 118 KB | 123 tools, 133 KB |
-| Network and SDN | `cluster,nodes,sdn,firewall` | 53 tools, 46 KB | 90 tools, 113 KB | 103 tools, 126 KB |
-| Everything except the raw API tool (default) | `all` | 154 tools, 131 KB | 261 tools, 344 KB | 306 tools, 388 KB |
-| Everything, including the raw API tool | `all,raw` | 155 tools, 133 KB | 262 tools, 346 KB | 307 tools, 389 KB |
+| Everyday monitoring | `cluster,nodes,vms,containers,storage,backup,tasks` | 78 tools, 69 KB | 132 tools, 188 KB | 149 tools, 206 KB |
+| Running guests day to day | `cluster,vms,containers,agent,snapshots,backup,tasks` | 46 tools, 43 KB | 81 tools, 128 KB | 89 tools, 138 KB |
+| Backup and snapshot hygiene | `cluster,snapshots,backup,storage,tasks` | 42 tools, 38 KB | 62 tools, 81 KB | 72 tools, 93 KB |
+| Security review | `cluster,nodes,access,firewall,tasks` | 66 tools, 53 KB | 108 tools, 123 KB | 126 tools, 138 KB |
+| Network and SDN | `cluster,nodes,sdn,firewall` | 54 tools, 47 KB | 93 tools, 118 KB | 106 tools, 131 KB |
+| Everything except the raw API tool (default) | `all` | 156 tools, 134 KB | 266 tools, 355 KB | 311 tools, 399 KB |
+| Everything, including the raw API tool | `all,raw` | 157 tools, 136 KB | 267 tools, 357 KB | 312 tools, 400 KB |
 
-Turning on exec as well adds the guest agent and monitor tools: `all` grows to 313 tools and 397 KB.
+Turning on exec as well adds the guest agent and monitor tools: `all` grows to 318 tools and 408 KB.
 
 List tools also take `search`, `fields` and, on long lists, `limit`, so the model can fetch only the items and fields it needs instead of whole lists.
 
@@ -244,7 +245,7 @@ PROXMOX_URL=https://pve1.example.lan:8006
 PROXMOX_API_TOKEN=mcp@pve!mcp=...
 PROXMOX_VERIFY_SSL=true
 PROXMOX_CA_FILE=/certs/pve-root-ca.pem   # copied from /etc/pve/pve-root-ca.pem
-PROXMOX_DEFAULT_NODE=pve1
+PROXMOX_NODE=pve1
 MCP_AUTH_TOKEN=...
 ```
 

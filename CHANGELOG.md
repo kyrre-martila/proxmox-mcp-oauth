@@ -16,6 +16,59 @@ For proxmox-mcp, the "public API" is the set of tool names, their arguments, the
 
 - Reject invalid OAuth consent decisions and passwords over 72 bytes before expensive bcrypt verification, retaining approval rate limiting and one-time consent.
 
+## [0.7.0] - 2026-11-17
+
+This release fixes lenient parsing of boolean and number settings, and renames tools, arguments and settings to match the other mattoddie MCP servers ahead of 1.0. proxmox-mcp has 319 tools (157 read, 110 write, 45 delete and 7 exec) and 8 prompts. Read the **Breaking** entries before upgrading.
+
+These changes align tool, argument and setting names with the other mattoddie MCP servers before 1.0. Old names are not accepted.
+
+### Changed
+
+- **Breaking:** tools renamed so the verb comes first: `proxmox_vm_power` → `proxmox_control_vm_power`, `proxmox_container_power` → `proxmox_control_container_power`, `proxmox_node_power` → `proxmox_control_node_power`, `proxmox_guest_power` → `proxmox_control_guest_power`, `proxmox_guest_fs_freeze` → `proxmox_control_guest_fs_freeze`, `proxmox_guest_fstrim` → `proxmox_trim_guest_filesystems`, `proxmox_guest_exec` → `proxmox_run_guest_command`, `proxmox_get_guest_exec_status` → `proxmox_get_guest_command_status`, `proxmox_guest_read_file` → `proxmox_read_guest_file`, `proxmox_guest_write_file` → `proxmox_write_guest_file`, `proxmox_guest_set_password` → `proxmox_set_guest_password`, `proxmox_ha_migrate` → `proxmox_migrate_ha_resource`, `proxmox_node_acme_certificate` → `proxmox_control_node_acme_certificate`, `proxmox_node_bulk_action` → `proxmox_run_node_bulk_action`, `proxmox_bulk_guest_action` → `proxmox_run_bulk_guest_action`, `proxmox_bulk_tag_guests` → `proxmox_tag_guests`, `proxmox_vm_monitor_command` → `proxmox_run_vm_monitor_command`, `proxmox_manage_node_service` → `proxmox_control_node_service` and `proxmox_run_replication_now` → `proxmox_run_replication_job`. Update any `PROXMOX_DENY_TOOLS` list that names them.
+- **Breaking:** `PROXMOX_DEFAULT_NODE` is now `PROXMOX_NODE`, and `PROXMOX_ALLOW_UNREDACTED` is now `PROXMOX_ALLOW_SECRETS`. The Claude Desktop bundle's default node setting is stored under a new key, so set it again after updating.
+- **Breaking:** the raw API tool's `redact: false` is now `include_secrets: true` (still only offered with `PROXMOX_ALLOW_SECRETS=true`).
+- **Breaking:** counts are `limit`: `max` on `proxmox_get_cluster_log`, `log_lines` on `proxmox_get_task` and `lastentries` on `proxmox_get_node_journal`.
+- **Breaking:** line offsets on the log tools are `offset` instead of `start`: `proxmox_get_node_syslog`, `proxmox_get_firewall_log`, `proxmox_get_ceph_log`, `proxmox_get_replication_log` and `proxmox_get_task_log` (whose result reports `offset` instead of `start`). `start` meaning "start the guest" is unchanged.
+- **Breaking:** time windows are `from`/`to` instead of `since`/`until`, always an ISO 8601 date or date-time string (a date alone is midnight UTC, a time without an offset is proxmox-mcp's local time): `proxmox_get_node_syslog`, `proxmox_get_node_journal`, `proxmox_get_firewall_log` and `proxmox_list_tasks` (`from` only). The firewall log and task list took UNIX times before, and the syslog took journalctl strings such as `yesterday`; the syslog now converts the times to the node's local time.
+- **Breaking:** seconds to wait are `timeout`: `timeout_s` on `proxmox_run_guest_command` and `proxmox_wait_for_task`, `wait_s` on `proxmox_get_guest_command_status`.
+- **Breaking:** `proxmox_list_privileges` returns `{total, returned, items}` like the other list tools, one item per privilege with its area, instead of `count` and `by_area`. It gains `search` and `fields`.
+
+### Fixed
+
+- **Breaking:** boolean settings only accept `true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off`, and anything else stops the server. Before, any other value meant `false`, so `PROXMOX_VERIFY_SSL=ture` silently turned certificate verification off and skipped the check that makes you choose how to verify an `https` connection. Number settings must be plain positive whole numbers: `PROXMOX_TIMEOUT_MS=30s` is now an error instead of 30.
+
+## [0.6.0] - 2026-11-15
+
+### Added
+
+- **Import from ESXi and OVA/OVF.** `proxmox_get_import_metadata` reads what Proxmox recognises in an ESXi VM or an OVA/OVF appliance on an import storage (suggested settings, disks, NICs and warnings), and `proxmox_import_vm` (write) creates the VM from it, importing each disk onto a target storage with `import-from`. Proxmox VE 8.2+ (OVA/OVF 8.3+).
+- **Capacity report.** `proxmox_get_capacity_report` compares what guests are allocated with the physical capacity per node and for the cluster: vCPUs against CPU threads, guest memory against RAM, and the provisioned size of guest disks against each storage's size (thin-provisioning overcommit), for running guests and for all guests.
+- **`PROXMOX_DENY_TOOLS`**: comma-separated tool names never to register, whatever the toolsets and access level allow. An unknown name stops the server at startup. It's also a setting in the Claude Desktop bundle and the MCP Registry entry.
+- **Tag management.** `proxmox_bulk_tag_guests` (write) adds and removes tags across many VMs and containers, chosen by VMID or by an existing tag (so it can rename a tag), with a dry run that lists every change. `proxmox_set_tag_options` (write) sets the datacenter's `tag-style` (shape, ordering, colours, case sensitivity), `user-tag-access` and `registered-tags`, changing only the fields given.
+- proxmox-mcp now has 319 tools (up from 314) and 8 prompts.
+
+### Security
+
+- **Breaking:** without `PROXMOX_ALLOW_DELETES`, arguments that delete data are refused: `delete_source` on `proxmox_move_vm_disk` and `proxmox_move_container_volume`, `retention` and `remove_old=true` on `proxmox_backup_guests` and `proxmox_save_backup_job`, and `remove_vanished` with `entry` or `acl` on `proxmox_sync_realm` (also when it comes from the realm's sync defaults, unless `dry_run`) and `proxmox_save_realm_sync_job`. Backups made without delete access are sent with `remove=0`, because Proxmox prunes older backups by default: `proxmox_backup_guests` and `proxmox_run_backup_job` no longer prune, and new backup jobs are created with `remove_old=false`.
+- **Breaking:** the raw API tool refuses the same without delete access: a VM `config` update with `force` (which deletes removed disks), `vzdump` without `remove=0` or with `prune-backups`, backup jobs that prune, and realm sync with `remove-vanished` containing `entry` or `acl`.
+- Remote storage scans (`proxmox_scan_storage` with nfs, cifs, pbs or iscsi), `proxmox_list_acme_directories` with `directory`, `proxmox_query_url_metadata` and the matching raw API `GET`s make the node connect out, so with writes on they now take `dry_run` (which no longer sends them) and are recorded in the audit log. `proxmox_scan_storage` and `proxmox_list_acme_directories` are no longer marked read-only when writes are on.
+- Secrets under generic names are now redacted in the audit log and dry-run previews: the private `key` of `proxmox_upload_node_certificate`, the subscription `key`, the PowerDNS `key` and the ACME plugin `data`. Field names with underscores, such as `client_key` and `encryption_key`, are matched like their hyphenated forms.
+- `proxmox_save_storage`, `proxmox_save_user`, `proxmox_save_backup_job`, `proxmox_set_node_repository` and `proxmox_save_notification_endpoint` are now marked destructive, because their updates can overwrite or disable what's there.
+
+### Changed
+
+- The `go` directive in `go.mod` is now 1.26, since Go 1.25 is no longer supported. The toolchain stays Go 1.27.4.
+
+## [0.5.2] - 2026-11-13
+
+### Added
+
+- Each release now has plain binaries for macOS, Linux and Windows on `amd64` and `arm64`, with a `SHA256SUMS` file and build provenance attestations, so you can run proxmox-mcp without Docker. See [Running without Docker](docs/deployment.md#running-without-docker).
+
+### Security
+
+- Built with Go 1.27.4, which fixes an HTTP/1 server crash in the standard library's `net/http` (GO-2026-6859).
+
 ## [0.5.1] - 2026-10-22
 
 ### Added
@@ -125,7 +178,10 @@ For proxmox-mcp, the "public API" is the set of tool names, their arguments, the
 - Multi-arch Docker image (`linux/amd64`, `linux/arm64`) published to GHCR on each release, with SBOM and provenance attestation.
 - Documentation, including a tool reference generated from the code.
 
-[Unreleased]: https://github.com/mattoddie/proxmox-mcp/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/mattoddie/proxmox-mcp/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/mattoddie/proxmox-mcp/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/mattoddie/proxmox-mcp/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/mattoddie/proxmox-mcp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/mattoddie/proxmox-mcp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/mattoddie/proxmox-mcp/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mattoddie/proxmox-mcp/compare/v0.3.0...v0.4.0

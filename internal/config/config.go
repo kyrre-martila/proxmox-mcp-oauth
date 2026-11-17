@@ -4,12 +4,13 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
-	"github.com/mattoddie/proxmox-mcp/internal/js"
 	"github.com/mattoddie/proxmox-mcp/internal/oauth"
 )
 
@@ -54,10 +55,13 @@ type Tools struct {
 	AllowDeletes bool
 	// AllowExec enables tools that run commands or write files in guests and on nodes; requires AllowWrites.
 	AllowExec bool
-	// AllowUnredacted lets the raw API tool return responses without secret redaction
-	// (its `redact: false` argument); PROXMOX_ALLOW_UNREDACTED.
-	AllowUnredacted bool
-	Toolsets        map[string]bool
+	// AllowSecrets lets the raw API tool return responses without secret redaction
+	// (its `include_secrets: true` argument); PROXMOX_ALLOW_SECRETS.
+	AllowSecrets bool
+	Toolsets     map[string]bool
+	// DenyTools are tool names never to register (PROXMOX_DENY_TOOLS), whatever the toolsets and
+	// access level allow. The tools package checks that each one exists.
+	DenyTools map[string]bool
 	// AuditLog is where calls of tools that change things are logged (PROXMOX_AUDIT_LOG): a file
 	// path, AuditLogStderr, or "" for no log.
 	AuditLog string
@@ -90,7 +94,7 @@ func CheckAuditLog(path string) error {
 
 // AllTools enables every tool, for documentation and tests.
 func AllTools() Tools {
-	t := Tools{AllowWrites: true, AllowDeletes: true, AllowExec: true, AllowUnredacted: true, Toolsets: map[string]bool{}}
+	t := Tools{AllowWrites: true, AllowDeletes: true, AllowExec: true, AllowSecrets: true, Toolsets: map[string]bool{}}
 	for _, ts := range Toolsets {
 		t.Toolsets[ts] = true
 	}
@@ -230,6 +234,7 @@ var (
 	fingerprintSep    = regexp.MustCompile(`[:\s]`)
 	hex64             = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 	tokenIDRe         = regexp.MustCompile(`^[^@\s]+@[^!\s]+![^\s=]+$`)
+	digits            = regexp.MustCompile(`^[0-9]+$`)
 )
 
 // ParseFingerprints parses PROXMOX_TLS_FINGERPRINT: one or more comma-separated SHA-256
@@ -256,24 +261,29 @@ func ParseFingerprints(value string) ([]string, error) {
 	return out, nil
 }
 
-func boolValue(v string, fallback bool) bool {
+// boolValue parses a boolean setting strictly: true/false, 1/0, yes/no or on/off
+// (case-insensitive). Anything else is an error, so a typo such as PROXMOX_VERIFY_SSL=ture
+// stops the server instead of quietly meaning false.
+func boolValue(name, v string, fallback bool) (bool, error) {
 	if v == "" {
-		return fallback
+		return fallback, nil
 	}
 	switch strings.ToLower(v) {
 	case "1", "true", "yes", "on":
-		return true
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
 	}
-	return false
+	return false, fmt.Errorf(`%s must be true or false (or 1/0, yes/no, on/off), got "%s"`, name, v)
 }
 
-// positiveInt parses like Number.parseInt(value, 10) (leading digits; "30s" is 30).
+// positiveInt parses a positive whole number strictly: "30s" or "1e3" is an error.
 func positiveInt(name, v string, fallback int) (int, error) {
 	if v == "" {
 		return fallback, nil
 	}
-	n := js.ParseInt(v)
-	if !js.IsFinite(n) || n <= 0 {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if !digits.MatchString(v) || err != nil || n <= 0 || n > math.MaxInt32 {
 		return 0, fmt.Errorf(`%s must be a positive integer, got "%s"`, name, v)
 	}
 	return int(n), nil
@@ -395,10 +405,17 @@ func Load(env Env) (*Config, error) {
 		return nil, fmt.Errorf(`MCP_TRANSPORT must be stdio or http, got "%s"`, transport)
 	}
 
-	allowWrites := boolValue(get("PROXMOX_ALLOW_WRITES"), false)
-	allowDeletes := boolValue(get("PROXMOX_ALLOW_DELETES"), false)
-	allowExec := boolValue(get("PROXMOX_ALLOW_EXEC"), false)
-	allowUnredacted := boolValue(get("PROXMOX_ALLOW_UNREDACTED"), false)
+	getBool := func(name string) bool {
+		b, err := boolValue(name, get(name), false)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return b
+	}
+	allowWrites := getBool("PROXMOX_ALLOW_WRITES")
+	allowDeletes := getBool("PROXMOX_ALLOW_DELETES")
+	allowExec := getBool("PROXMOX_ALLOW_EXEC")
+	allowSecrets := getBool("PROXMOX_ALLOW_SECRETS")
 	auditLog := get("PROXMOX_AUDIT_LOG")
 	if firstErr != nil {
 		return nil, firstErr
@@ -444,6 +461,13 @@ func Load(env Env) (*Config, error) {
 		toolsets[t] = true
 	}
 
+	denyTools := map[string]bool{}
+	for _, name := range strings.Split(get("PROXMOX_DENY_TOOLS"), ",") {
+		if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
+			denyTools[name] = true
+		}
+	}
+
 	var allowedHosts []string
 	for _, h := range strings.Split(get("MCP_ALLOWED_HOSTS"), ",") {
 		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
@@ -457,7 +481,7 @@ func Load(env Env) (*Config, error) {
 			oauthCfg.Redirects = append(oauthCfg.Redirects, u)
 		}
 	}
-	allowUnauthenticated := boolValue(get("MCP_ALLOW_UNAUTHENTICATED"), false)
+	allowUnauthenticated := getBool("MCP_ALLOW_UNAUTHENTICATED")
 	if firstErr != nil {
 		return nil, firstErr
 	}
@@ -484,9 +508,10 @@ func Load(env Env) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	defaultNode := get("PROXMOX_DEFAULT_NODE")
+	defaultNode := get("PROXMOX_NODE")
 	verifySetting := get("PROXMOX_VERIFY_SSL")
-	verify := caCert != "" || boolValue(verifySetting, false)
+	verifyOn := getBool("PROXMOX_VERIFY_SSL")
+	verify := caCert != "" || verifyOn
 	if firstErr != nil {
 		return nil, firstErr
 	}
@@ -508,7 +533,7 @@ func Load(env Env) (*Config, error) {
 			TaskTimeoutMs:   taskTimeoutMs,
 			DefaultNode:     defaultNode,
 		},
-		Tools:     Tools{AllowWrites: allowWrites, AllowDeletes: allowDeletes, AllowExec: allowExec, AllowUnredacted: allowUnredacted, Toolsets: toolsets, AuditLog: auditLog},
+		Tools:     Tools{AllowWrites: allowWrites, AllowDeletes: allowDeletes, AllowExec: allowExec, AllowSecrets: allowSecrets, Toolsets: toolsets, DenyTools: denyTools, AuditLog: auditLog},
 		Transport: transport,
 		HTTP: HTTP{
 			OAuth:                oauthCfg,

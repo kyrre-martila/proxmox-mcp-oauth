@@ -32,6 +32,8 @@ type guarded struct {
 	// read is true when the arguments make this call a read (Def.Reads).
 	read   bool
 	dryRun bool
+	// secrets are argument names to redact in the audit log (Def.Secrets).
+	secrets []string
 }
 
 // dryRun runs a handler as a dry run: requests that change something are stopped and the first
@@ -43,6 +45,9 @@ func (c *Context) dryRun(ctx context.Context, call *proxmox.Call, a *Obj, handle
 	if req == nil {
 		if err != nil {
 			return nil, err
+		}
+		if p, ok := out.(plannedChanges); ok {
+			return js.Spread(js.O("dry_run", true), p.plan, js.O("note", "Nothing was changed: this was a dry run. The changes listed were not made. Call the tool again without dry_run to make them.")), nil
 		}
 		return js.O("dry_run", true, "would_send", nil, "note", "The tool would not send any request that changes something. result is what it returned.", "result", out), nil
 	}
@@ -100,7 +105,7 @@ func (l *auditLog) record(tool string, raw json.RawMessage, state *guarded, call
 		"time", time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00"),
 		"tool", tool,
 		"dry_run", state.dryRun,
-		"arguments", proxmox.RedactSecrets(args),
+		"arguments", proxmox.RedactSecrets(args, proxmox.RedactOptions{Keys: state.secrets}),
 		"requests", requests,
 	)
 	if p, _ := call.Intercepted(); p != nil {

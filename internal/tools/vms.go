@@ -19,6 +19,7 @@ import (
 var (
 	vmsDiskRe      = regexp.MustCompile(`^(ide[0-3]|sata[0-5]|scsi([0-9]|[12][0-9]|30)|virtio([0-9]|1[0-5])|efidisk0|tpmstate0)$`)
 	vmsDiskKeyArg  = Str().Pattern(`^(ide[0-3]|sata[0-5]|scsi([0-9]|[12][0-9]|30)|virtio([0-9]|1[0-5])|efidisk0|tpmstate0)$`, "a disk key such as scsi0, virtio1, sata0, ide0, efidisk0 or tpmstate0").D("Disk key, e.g. scsi0, virtio1, sata0")
+	vmsNetKeyRe    = regexp.MustCompile(`^net\d+$`)
 	vmsSkiplockArg = Bool().Opt().D("Ignore a config lock (root@pam only; use with care)")
 	vmsOstypes     = []string{"other", "wxp", "w2k", "w2k3", "w2k8", "wvista", "win7", "win8", "win10", "win11", "l24", "l26", "solaris"}
 	vmsScsihw      = []string{"lsi", "lsi53c810", "virtio-scsi-pci", "virtio-scsi-single", "megasas", "pvscsi"}
@@ -773,7 +774,7 @@ func registerVms(c *Context) {
 				js.O(
 					"config", vmsSummarizeConfig(configObj),
 					"pending_changes", changes,
-					"note", ifThen(len(changes) > 0, "Pending changes apply at the next VM restart (proxmox_vm_power action=reboot) or can be reverted with proxmox_update_vm_config revert=[...]"),
+					"note", ifThen(len(changes) > 0, "Pending changes apply at the next VM restart (proxmox_control_vm_power action=reboot) or can be reverted with proxmox_update_vm_config revert=[...]"),
 				),
 			)), nil
 		},
@@ -990,7 +991,7 @@ func registerVms(c *Context) {
 
 	// ---------------------------------------------------------------- write
 
-	c.Define("proxmox_vm_power", Def{
+	c.Define("proxmox_control_vm_power", Def{
 		Toolset:     "vms",
 		Title:       "Start, stop or reboot a VM",
 		Description: "Change a VM's power state. start; shutdown (clean ACPI shutdown, optionally force_stop after timeout); stop (hard power-off, may lose data); reboot (clean, applies pending config); reset (hard reset); suspend (pause in RAM); resume; hibernate (save RAM to disk and stop; resumes on next start). Reports without acting when the VM is already in the requested state.",
@@ -1203,6 +1204,119 @@ func registerVms(c *Context) {
 		},
 	})
 
+	c.Define("proxmox_import_vm", Def{
+		Toolset:     "vms",
+		Title:       "Import a VM from ESXi or OVA",
+		Description: "Create a VM from an importable guest (an ESXi VM or an OVA/OVF appliance) using the metadata Proxmox reads from it (see proxmox_get_import_metadata): its suggested settings, each recognised disk imported onto target_storage with import-from, and its NICs (on `bridge` when they don't name one). The source isn't changed. Check the metadata's warnings first: shut the ESXi VM down, and an OVA's disks are extracted to working_storage (default the source storage). With bios=ovmf a fresh EFI vars disk is added on target_storage. `name` and `extra` (Proxmox parameter names, e.g. {cores: 4, memory: 8192}) override the suggested settings. VMID defaults to the next free one. Importing copies whole disks and can take a long time. Proxmox VE 8.2+ (OVA/OVF 8.3+).",
+		Write:       true,
+		Destructive: False,
+		Input: []Prop{
+			P("node", nodeArg),
+			P("volume", importVolumeArg),
+			P("storage", storageVolStArg),
+			P("target_storage", Str().Min(1).D("Storage to import the disks onto, e.g. local-lvm")),
+			P("vmid", Int().Min(100).Max(999999999).Opt().D("VMID for the new VM (default: next free ID)")),
+			P("name", Str().Opt().D("VM name (default: the source's)")),
+			P("format", Enum("raw", "qcow2", "vmdk").Opt().D("Disk format on file-based target storage")),
+			P("bridge", Str().Opt().D("Bridge for NICs the metadata doesn't put on one (default vmbr0)")),
+			P("working_storage", Str().Opt().D("File-based storage with images content to extract OVA disks to during the import (import-working-storage; default the source storage)")),
+			P("start", Bool().Opt().D("Start the VM after importing it")),
+			P("pool", Str().Opt().D("Add the VM to this resource pool")),
+			P("extra", extraArg),
+			P("wait", waitArg),
+		},
+		Handler: func(ctx context.Context, a *Obj) (any, error) {
+			node, err := c.node(ctx, a)
+			if err != nil {
+				return nil, err
+			}
+			storage, err := storageVolumeStorage(a)
+			if err != nil {
+				return nil, err
+			}
+			md, err := getImportMetadata(ctx, client, node, storage, a.Get("volume"))
+			if err != nil {
+				return nil, err
+			}
+			if t := md.Get("type"); !js.Nullish(t) && t != "vm" {
+				return nil, fmt.Errorf("Proxmox reports this guest as type %s; only VM imports are supported", js.Str(t))
+			}
+			vmid := a.Get("vmid")
+			if js.Nullish(vmid) {
+				id, err := nextID(ctx)
+				if err != nil {
+					return nil, err
+				}
+				vmid = id
+			}
+			suggested := js.NewObj()
+			if args := md.ObjAt("create-args"); args != nil {
+				suggested = js.Spread(args)
+			}
+			target := a.Str("target_storage")
+			own := js.O("vmid", vmid, "name", a.Get("name"))
+			var diskKeys []string
+			if disks := md.ObjAt("disks"); disks != nil {
+				for _, k := range disks.Keys() {
+					if !vmsDiskRe.MatchString(k) {
+						return nil, fmt.Errorf("Unexpected disk key %s in the import metadata", js.Quote(k))
+					}
+					own.Set(k, proxmox.ToPropertyString(js.O("_default", target+":0", "import-from", disks.Get(k), "format", a.Get("format")), "_default"))
+					diskKeys = append(diskKeys, k)
+				}
+			}
+			if len(diskKeys) == 0 {
+				return nil, errors.New("Proxmox found no disks to import in this guest")
+			}
+			if nets := md.ObjAt("net"); nets != nil {
+				for _, k := range nets.Keys() {
+					if !vmsNetKeyRe.MatchString(k) {
+						return nil, fmt.Errorf("Unexpected NIC key %s in the import metadata", js.Quote(k))
+					}
+					n, ok := nets.Get(k).(*Obj)
+					if !ok {
+						own.Set(k, js.Str(nets.Get(k)))
+						continue
+					}
+					n = js.Spread(n)
+					if !n.Truthy("bridge") {
+						n.Set("bridge", or(a.Get("bridge"), "vmbr0"))
+					}
+					own.Set(k, proxmox.ToPropertyString(n, "model"))
+				}
+			}
+			bios := suggested.Get("bios")
+			if x := a.ObjAt("extra"); x != nil && x.Defined("bios") {
+				bios = x.Get("bios")
+			}
+			if bios == "ovmf" && !suggested.Defined("efidisk0") {
+				own.Set("efidisk0", target+":1,efitype=4m")
+			}
+			own.Set("import-working-storage", a.Get("working_storage"))
+			own.Set("start", a.Get("start"))
+			own.Set("pool", a.Get("pool"))
+			// These turn a create into a backup restore, which with force overwrites an existing VM.
+			own, err = withExtra(own, a.Get("extra"), "archive", "force", "unique", "live-restore")
+			if err != nil {
+				return nil, err
+			}
+			for _, k := range own.Keys() {
+				if v := own.Get(k); !js.IsUndef(v) || !suggested.Has(k) {
+					suggested.Set(k, v)
+				}
+			}
+			body := defined(suggested)
+			if err := checkGuestConfigGates(c, body, ""); err != nil {
+				return nil, err
+			}
+			upid, err := client.Post(ctx, "/nodes/"+enc(node)+"/qemu", body)
+			if err != nil {
+				return nil, err
+			}
+			return runTask(ctx, client, upid, a.Get("wait"), proxmox.C("vmid", vmid, "node", node, "name", body.Get("name"), "source", md.Get("source"), "disks", diskKeys, "warnings", md.Get("warnings")))
+		},
+	})
+
 	c.Define("proxmox_clone_vm", Def{
 		Toolset:     "vms",
 		Title:       "Clone a VM or template",
@@ -1329,7 +1443,7 @@ func registerVms(c *Context) {
 			changes := vmsPendingChanges(pending(ctx, client.GuestPath(g)))
 			return proxmox.Compact(js.Spread(result, js.O(
 				"pending_changes", changes,
-				"note", ifThen(len(changes) > 0, "Some changes are pending and take effect after a reboot (proxmox_vm_power action=reboot)"),
+				"note", ifThen(len(changes) > 0, "Some changes are pending and take effect after a reboot (proxmox_control_vm_power action=reboot)"),
 			))), nil
 		},
 	})
@@ -1365,7 +1479,7 @@ func registerVms(c *Context) {
 	c.Define("proxmox_move_vm_disk", Def{
 		Toolset:     "vms",
 		Title:       "Move a VM disk",
-		Description: "Move a VM disk to another storage (works live on running VMs) or reassign it to another VM (target_vmid, optionally target_disk). After a storage move the old copy is kept as an unused disk unless delete_source=true.",
+		Description: "Move a VM disk to another storage (works live on running VMs) or reassign it to another VM (target_vmid, optionally target_disk). After a storage move the old copy is kept as an unused disk unless delete_source=true, which needs delete access (PROXMOX_ALLOW_DELETES).",
 		Write:       true,
 		Destructive: True,
 		Input: []Prop{
@@ -1388,6 +1502,9 @@ func registerVms(c *Context) {
 			}
 			if a.Truthy("storage") && a.Defined("target_vmid") {
 				return nil, errors.New("Give either storage or target_vmid, not both")
+			}
+			if a.Truthy("delete_source") && !c.AllowDeletes {
+				return nil, errors.New("delete_source permanently deletes the original disk and needs delete access (PROXMOX_ALLOW_DELETES=true); without it the old copy is kept as an unusedN disk")
 			}
 			g, err := vm(ctx, a)
 			if err != nil {
@@ -1502,7 +1619,7 @@ func registerVms(c *Context) {
 				return refWith(g, "status", "already a template"), nil
 			}
 			if g.Status == "running" {
-				return nil, fmt.Errorf("VM %s is running; shut it down first (proxmox_vm_power action=shutdown)", js.NumStr(g.VMID))
+				return nil, fmt.Errorf("VM %s is running; shut it down first (proxmox_control_vm_power action=shutdown)", js.NumStr(g.VMID))
 			}
 			upid, err := client.Post(ctx, client.GuestPath(g)+"/template", defined(js.O("disk", a.Get("disk"))))
 			if err != nil {
@@ -1617,7 +1734,7 @@ func registerVms(c *Context) {
 		},
 	})
 
-	c.Define("proxmox_vm_monitor_command", Def{
+	c.Define("proxmox_run_vm_monitor_command", Def{
 		Toolset:     "vms",
 		Title:       "Run a QEMU monitor command",
 		Description: "Run a QEMU human monitor (HMP) command on a running VM and return its output, e.g. 'info status', 'info block', 'info network', 'info cpus', 'info balloon', 'info migrate'. Non-info commands (e.g. 'balloon 2048', 'device_del') change the live VM; prefer the dedicated tools where they exist.",
